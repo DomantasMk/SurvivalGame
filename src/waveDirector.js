@@ -12,7 +12,6 @@ const BASE_SPAWN_INTERVAL = 2.0; // seconds between spawn waves
 const MIN_SPAWN_INTERVAL = 0.5;
 const BASE_ENEMIES_PER_WAVE = 2;
 const BOSS_INTERVAL = 360; // 6 minutes
-const MULTIPLAYER_SCALE = 1.3; // 30% more enemies for 2 players
 
 const SPAWN_DISTANCE_MIN = 18;
 const SPAWN_DISTANCE_MAX = 25;
@@ -35,8 +34,11 @@ export function updateWaveDirector(delta, players) {
   const spawnInterval =
     BASE_SPAWN_INTERVAL -
     (BASE_SPAWN_INTERVAL - MIN_SPAWN_INTERVAL) * difficultyFactor;
+  // Scale enemy count based on alive player count (1 player = 1x, 2 = 1.6x, ... 5 = 3.4x)
+  const alivePlayers = players.filter((p) => p.alive);
+  const multiplayerScale = 1 + (alivePlayers.length - 1) * 0.6;
   const enemiesPerWave = Math.floor(
-    (BASE_ENEMIES_PER_WAVE + difficultyFactor * 7) * MULTIPLAYER_SCALE,
+    (BASE_ENEMIES_PER_WAVE + difficultyFactor * 7) * multiplayerScale,
   );
 
   // --- Spawn timer ---

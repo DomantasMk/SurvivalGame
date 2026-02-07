@@ -1,6 +1,5 @@
 // upgradeMenu.js — Level-up screen: per-player upgrades with network support
 
-import { gameState } from "./main.js";
 import { WEAPON_DEFS, addWeapon, levelUpWeapon } from "./weaponManager.js";
 import { shuffle } from "./utils.js";
 
@@ -131,7 +130,6 @@ export function generateUpgradeChoices(playerObj) {
  */
 export function showUpgradeMenuUI(choices, playerLabel, onPick) {
   _isOpen = true;
-  gameState.paused = true;
 
   overlay.innerHTML = `
     <h2 style="color: #ffcc00; font-size: 36px; margin-bottom: 8px; text-shadow: 0 0 10px #ffcc00;">
@@ -211,7 +209,6 @@ export function applyUpgradeChoice(choice, playerObj) {
  */
 export function hideUpgradeMenu() {
   _isOpen = false;
-  gameState.paused = false;
   overlay.style.display = "none";
   overlay.innerHTML = "";
 }

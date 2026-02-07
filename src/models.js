@@ -146,13 +146,26 @@ export function createPlayerModel(colorTheme = "blue") {
   const EYES = 0x222244;
   const BELT_COL = 0x885533;
 
-  // Color theme for Player 1 (blue) vs Player 2 (red)
+  // Color theme per player
   let OUTFIT, DARK, SCARF;
   if (colorTheme === "red") {
     OUTFIT = 0xff4444;
     DARK = 0xcc2222;
     SCARF = 0x4488ff;
+  } else if (colorTheme === "green") {
+    OUTFIT = 0x44cc44;
+    DARK = 0x22aa22;
+    SCARF = 0xffcc00;
+  } else if (colorTheme === "purple") {
+    OUTFIT = 0xaa44ff;
+    DARK = 0x7722cc;
+    SCARF = 0x44ccff;
+  } else if (colorTheme === "orange") {
+    OUTFIT = 0xff8800;
+    DARK = 0xcc6600;
+    SCARF = 0x44aaff;
   } else {
+    // default: blue
     OUTFIT = 0x4488ff;
     DARK = 0x2255cc;
     SCARF = 0xcc3333;

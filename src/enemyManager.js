@@ -65,7 +65,7 @@ export const ENEMY_TYPES = {
   },
 };
 
-const MAX_ENEMIES = 300;
+const MAX_ENEMIES = 600;
 const DAMAGE_COOLDOWN = 1.2; // seconds between enemy hits on player
 const KNOCKBACK_FORCE = 4;
 

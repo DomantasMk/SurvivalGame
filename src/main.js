@@ -1,4 +1,4 @@
-// main.js — Entry point, multiplayer orchestration (host-authoritative)
+// main.js — Entry point, multiplayer orchestration (host-authoritative, up to 5 players)
 
 import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
@@ -47,7 +47,14 @@ import {
 } from "./upgradeMenu.js";
 import { updateParticles } from "./particles.js";
 import { getMovementVector } from "./input.js";
-import { connect, send, onMessage, isHost, isGuest } from "./network.js";
+import {
+  connect,
+  send,
+  onMessage,
+  isHost,
+  isGuest,
+  getPlayerIndex,
+} from "./network.js";
 import { createSeededRandom } from "./utils.js";
 import {
   createEnemyModel,
@@ -72,28 +79,41 @@ export const gameState = {
 const ARENA_SIZE = 100;
 const ARENA_HALF = ARENA_SIZE / 2;
 const PLAYER_SIZE = 0.5;
-const STATE_SEND_INTERVAL = 1; // Send state every frame (60 Hz at 60fps)
+const STATE_SEND_INTERVAL = 1; // Send state every frame
 
-// Player references (set during init)
-let player1 = null;
-let player2 = null;
+// Player configuration (up to 5)
+const COLOR_THEMES = ["blue", "red", "green", "purple", "orange"];
+const PLAYER_HEX_COLORS = [
+  "#4488ff",
+  "#ff4444",
+  "#44cc44",
+  "#aa44ff",
+  "#ff8800",
+];
 
-// Host-side: latest input from the guest player
-let _remoteInput = { x: 0, z: 0 };
-let _guestConnected = false;
+// Dynamic player array (set during init, ordered by _gamePlayerIndices)
+const players = [];
+let _gamePlayerIndices = []; // frozen when game starts
+let _myPlayerArrayIndex = 0; // this client's index in players[]
+
+// Host-side: latest inputs from guest players (keyed by playerIndex)
+const _remoteInputs = {};
 let _sendFrameCounter = 0;
-let _pendingP2Choices = null; // upgrade choices waiting for guest pick
+const _pendingUpgradeChoices = {}; // keyed by playerIndex
+
+// Lobby state
+let _lobbyPlayerIndices = [];
 
 // Guest-side: latest state from the host
-let _currentHostState = null; // Most recent state from host
-let _previousHostState = null; // Previous state for interpolation
-let _currentStateTime = 0; // When current state was received
-let _previousStateTime = 0; // When previous state was received
-let _guestLocalTime = 0; // Local time for smooth animations
-const INTERPOLATION_DELAY = 0.01; // Small delay for interpolation (10ms) - reduced for localhost
-const _guestEnemyMap = new Map(); // id -> { mesh, anim, typeKey, size, prevPos }
-const _guestProjectiles = []; // array of THREE.Mesh
-const _guestGems = []; // array of THREE.Mesh
+let _currentHostState = null;
+let _previousHostState = null;
+let _currentStateTime = 0;
+let _previousStateTime = 0;
+let _guestLocalTime = 0;
+const INTERPOLATION_DELAY = 0.01;
+const _guestEnemyMap = new Map();
+const _guestProjectiles = [];
+const _guestGems = [];
 
 // ---------- Initialization ----------
 
@@ -169,8 +189,6 @@ async function init() {
   gridHelper.position.y = 0.01;
   scene.add(gridHelper);
 
-  // --- Arena Decorations are generated after networking (seeded for sync) ---
-
   // --- Ground Collider (Rapier) ---
   const groundColliderDesc = RAPIER.ColliderDesc.cuboid(
     ARENA_HALF,
@@ -224,18 +242,23 @@ async function init() {
   const role = await _showLobby();
   gameState.role = role;
 
-  // --- Wait for both players ---
+  // --- Lobby waiting phase (player list + start/wait) ---
   let worldSeed;
+  let gamePlayerIndices;
+
   if (isHost()) {
-    _setLobbyStatus("Waiting for Player 2 to join...");
-    await _waitForGuest();
-    _setLobbyStatus("Player 2 connected! Starting game...");
-    worldSeed = Math.floor(Math.random() * 2147483647);
-    await _delay(500);
+    const result = await _showLobbyWaitingHost();
+    worldSeed = result.seed;
+    gamePlayerIndices = result.playerIndices;
   } else {
-    _setLobbyStatus("Connected as Guest! Waiting for host to start...");
-    worldSeed = await _waitForGameStart(); // receives seed from host
+    const result = await _showLobbyWaitingGuest();
+    worldSeed = result.seed;
+    gamePlayerIndices = result.playerIndices;
   }
+
+  _gamePlayerIndices = gamePlayerIndices;
+  _myPlayerArrayIndex = _gamePlayerIndices.indexOf(getPlayerIndex());
+  if (_myPlayerArrayIndex < 0) _myPlayerArrayIndex = 0;
 
   // --- Generate arena decorations using shared seed ---
   _generateDecorations(scene, worldSeed);
@@ -243,17 +266,24 @@ async function init() {
   // --- Hide lobby ---
   _hideLobby();
 
-  // --- Create both players ---
-  player1 = createPlayer(scene, world, {
-    spawnX: -2,
-    spawnZ: 0,
-    colorTheme: "blue",
-  });
-  player2 = createPlayer(scene, world, {
-    spawnX: 2,
-    spawnZ: 0,
-    colorTheme: "red",
-  });
+  // --- Create players in a circle ---
+  const numPlayers = _gamePlayerIndices.length;
+  const spawnRadius = numPlayers === 1 ? 0 : 3;
+  for (let i = 0; i < numPlayers; i++) {
+    const angle = (i / numPlayers) * Math.PI * 2 - Math.PI / 2;
+    const spawnX = numPlayers === 1 ? 0 : Math.cos(angle) * spawnRadius;
+    const spawnZ = numPlayers === 1 ? 0 : Math.sin(angle) * spawnRadius;
+    const colorTheme = COLOR_THEMES[i % COLOR_THEMES.length];
+    const p = createPlayer(scene, world, { spawnX, spawnZ, colorTheme });
+    players.push(p);
+  }
+
+  // Initialize remote inputs for each guest player
+  for (const pi of _gamePlayerIndices) {
+    if (pi !== getPlayerIndex()) {
+      _remoteInputs[pi] = { x: 0, z: 0 };
+    }
+  }
 
   // --- Initialize game systems (host only for simulation, both for rendering) ---
   if (isHost()) {
@@ -263,25 +293,21 @@ async function init() {
     createXpManager(scene);
     createWaveDirector();
 
-    // Both players start with Magic Wand
-    addWeapon(player1, "magicWand");
-    addWeapon(player2, "magicWand");
+    // All players start with Magic Wand
+    for (const p of players) {
+      addWeapon(p, "magicWand");
+    }
 
     // Set up level-up callback
     setLevelUpCallback(_onPlayerLevelUp);
   }
 
   // Both host and guest need HUD and upgrade menu
-  createHud();
+  createHud(numPlayers, PLAYER_HEX_COLORS);
   createUpgradeMenu();
 
   // --- Setup network message handlers ---
   _setupNetworkHandlers();
-
-  // --- Host signals game start (includes seed so guest generates same world) ---
-  if (isHost()) {
-    send({ type: "game_start", seed: worldSeed });
-  }
 
   // --- Handle Window Resize ---
   window.addEventListener("resize", () => {
@@ -292,7 +318,7 @@ async function init() {
 
   // --- Shadow light + player light follows local player ---
   function updateLights() {
-    const localPlayer = isHost() ? player1 : player2;
+    const localPlayer = players[_myPlayerArrayIndex];
     if (!localPlayer || !localPlayer.mesh) return;
     directionalLight.position.set(
       localPlayer.mesh.position.x + 5,
@@ -327,24 +353,15 @@ async function init() {
 // ---------- Host Game Loop ----------
 
 function _animateHost(clock, scene, camera, renderer, world, updateLights) {
-  // Use performance.now() for manual timing so we don't depend on THREE.Clock
-  // across setTimeout ticks (THREE.Clock works, but explicit timing is clearer).
   let _lastTime = performance.now();
 
   function loop() {
-    // IMPORTANT: Use setTimeout instead of requestAnimationFrame.
-    // RAF is paused entirely when a tab is in the background, which would
-    // freeze the host simulation and stop state updates to the guest.
-    // setTimeout is throttled to ~1 s in background tabs but still fires.
-    // Reduced delay for higher update frequency: 8ms = ~120fps, 4ms = ~250fps
-    setTimeout(loop, 8); // Increased from 16ms to 8ms for ~120 Hz updates
+    setTimeout(loop, 8);
 
     const now = performance.now();
     const rawDelta = (now - _lastTime) / 1000;
     _lastTime = now;
 
-    // Allow a bigger time step when the tab is hidden so the simulation can
-    // partially catch up (background setTimeout fires only ~once per second).
     const delta = Math.min(rawDelta, document.hidden ? 0.1 : 0.05);
 
     if (gameState.paused || gameState.gameOver) {
@@ -354,52 +371,55 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
 
     gameState.gameTime += delta;
 
-    // --- Get inputs ---
-    const localInput = getMovementVector(); // Player 1 (host)
-    const remoteInput = _remoteInput; // Player 2 (guest)
+    // --- Get inputs and update all players ---
+    const localInput = getMovementVector();
+    for (let i = 0; i < players.length; i++) {
+      const pi = _gamePlayerIndices[i];
+      const input =
+        pi === getPlayerIndex()
+          ? localInput
+          : _remoteInputs[pi] || { x: 0, z: 0 };
+      updatePlayer(players[i], delta, ARENA_HALF, input);
+    }
 
-    // --- Update players ---
-    updatePlayer(player1, delta, ARENA_HALF, localInput);
-    updatePlayer(player2, delta, ARENA_HALF, remoteInput);
-
-    // --- Camera follows player 1 (host's player) ---
+    // --- Camera follows host's player ---
     if (!document.hidden) {
-      updateCamera(camera, player1.mesh, delta);
+      updateCamera(camera, players[_myPlayerArrayIndex].mesh, delta);
       updateLights();
     }
 
     // --- Game systems ---
-    const allPlayers = [player1, player2];
-
-    updateWaveDirector(delta, allPlayers);
-    updateEnemies(delta, allPlayers);
-    updateWeapons(delta, player1, enemies);
-    updateWeapons(delta, player2, enemies);
+    updateWaveDirector(delta, players);
+    updateEnemies(delta, players);
+    for (const p of players) {
+      updateWeapons(delta, p, enemies);
+    }
     updateWeaponVisuals(delta, enemies);
     updateProjectiles(delta, enemies);
-    updateXpGems(delta, allPlayers);
+    updateXpGems(delta, players);
     updateParticles(delta);
 
     if (!document.hidden) {
-      updateHud(player1, player1, player2, gameState);
+      updateHud(players[_myPlayerArrayIndex], players, gameState);
     }
 
     // Step the physics world
     world.step();
 
-    // Only render when the tab is visible (save GPU while in background)
+    // Only render when the tab is visible
     if (!document.hidden) {
       renderer.render(scene, camera);
     }
 
-    // --- Send state to guest (always, even when hidden) ---
+    // --- Send state to guests (always, even when hidden) ---
     _sendFrameCounter++;
     if (_sendFrameCounter % STATE_SEND_INTERVAL === 0) {
       _sendGameState();
     }
 
-    // --- Check game over (both players dead) ---
-    if (!player1.alive && !player2.alive && !gameState.gameOver) {
+    // --- Check game over (ALL players dead) ---
+    const allDead = players.every((p) => !p.alive);
+    if (allDead && !gameState.gameOver) {
       gameState.gameOver = true;
       _showGameOver();
       send({ type: "game_over" });
@@ -413,47 +433,46 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
 
 function _animateGuest(clock, scene, camera, renderer, updateLights) {
   let _inputSendCounter = 0;
-  const INPUT_SEND_INTERVAL = 1; // Send input every frame for responsiveness
+  const INPUT_SEND_INTERVAL = 1;
 
   function loop() {
     requestAnimationFrame(loop);
 
     const delta = Math.min(clock.getDelta(), 0.05);
     _guestLocalTime += delta;
-    const now = performance.now();
 
-    // --- Send local input to host (throttled) ---
+    // --- Send local input to host ---
     _inputSendCounter++;
     if (_inputSendCounter % INPUT_SEND_INTERVAL === 0) {
       const localInput = getMovementVector();
-      send({ type: "input", mx: localInput.x, mz: localInput.z });
+      send({
+        type: "input",
+        pi: getPlayerIndex(),
+        mx: localInput.x,
+        mz: localInput.z,
+      });
     }
 
-    // --- Handle new state from host ---
-    // (State is stored in _handleGuestMessage, we just process it here)
-
-    // --- Apply state updates (fallback if state arrived between frames) ---
-    // States are applied immediately when received, but we also check here
-    // in case a state arrived but wasn't applied yet
+    // --- Apply state updates ---
     if (_currentHostState && !_previousHostState) {
-      // First state, make sure it's applied
       _applyHostState(_currentHostState, scene, 1.0);
       _previousHostState = _deepCloneState(_currentHostState);
       _previousStateTime = _currentStateTime;
     }
 
-    // --- Continuously animate enemies (smooth animation between state updates) ---
+    // --- Continuously animate enemies and gems ---
     _animateGuestEnemies(_guestLocalTime);
-
-    // --- Continuously animate gems (rotation) ---
     _animateGuestGems(delta);
 
-    // --- Camera follows player 2 (guest's player) ---
-    updateCamera(camera, player2.mesh, delta);
+    // --- Camera follows local player ---
+    const localPlayer = players[_myPlayerArrayIndex];
+    if (localPlayer) {
+      updateCamera(camera, localPlayer.mesh, delta);
+    }
     updateLights();
 
     // --- Update HUD ---
-    updateHud(player2, player1, player2, gameState);
+    updateHud(players[_myPlayerArrayIndex], players, gameState);
 
     renderer.render(scene, camera);
   }
@@ -461,7 +480,7 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
   loop();
 }
 
-// ---------- State Serialization (Host -> Guest) ----------
+// ---------- State Serialization (Host -> Guests) ----------
 
 function _sendGameState() {
   const state = {
@@ -470,8 +489,7 @@ function _sendGameState() {
     tk: gameState.totalKills,
     go: gameState.gameOver,
     pa: gameState.paused,
-    p1: _serializePlayer(player1),
-    p2: _serializePlayer(player2),
+    pl: players.map((p) => _serializePlayer(p)),
     en: enemies.map((e) => ({
       id: e.id,
       x: e.mesh.position.x,
@@ -515,23 +533,20 @@ function _serializePlayer(p) {
 // ---------- State Cloning (for interpolation) ----------
 
 function _deepCloneState(state) {
-  // Deep clone the state object to prevent reference issues
-  // Using JSON parse/stringify for simplicity and correctness
-  // This is fast enough for localhost with ~60 updates/sec
   return JSON.parse(JSON.stringify(state));
 }
 
 // ---------- State Deserialization (Guest receives Host state) ----------
 
 function _applyHostState(state, scene, interpolationFactor) {
-  // Update game state (non-interpolated values)
   gameState.gameTime = state.gt;
   gameState.totalKills = state.tk;
   gameState.gameOver = state.go;
 
-  // Update player states
-  _applyPlayerState(player1, state.p1, interpolationFactor);
-  _applyPlayerState(player2, state.p2, interpolationFactor);
+  // Update all players
+  for (let i = 0; i < players.length && i < state.pl.length; i++) {
+    _applyPlayerState(players[i], state.pl[i], interpolationFactor);
+  }
 
   // Sync enemy meshes
   _syncGuestEnemies(state.en, scene, interpolationFactor);
@@ -551,27 +566,22 @@ function _applyHostState(state, scene, interpolationFactor) {
 
 // Interpolate between two states
 function _interpolateHostState(prevState, currState, scene, t) {
-  // Update game state (non-interpolated, use current state)
   gameState.gameTime = currState.gt;
   gameState.totalKills = currState.tk;
   gameState.gameOver = currState.go;
 
-  // Interpolate player states between previous and current
-  _interpolatePlayerState(player1, prevState.p1, currState.p1, t);
-  _interpolatePlayerState(player2, prevState.p2, currState.p2, t);
+  for (let i = 0; i < players.length; i++) {
+    if (prevState.pl && prevState.pl[i] && currState.pl && currState.pl[i]) {
+      _interpolatePlayerState(players[i], prevState.pl[i], currState.pl[i], t);
+    }
+  }
 
-  // Interpolate enemy positions
   _interpolateGuestEnemies(prevState.en, currState.en, scene, t);
-
-  // Interpolate projectile positions
   _interpolateGuestProjectiles(prevState.pr, currState.pr, scene, t);
-
-  // Interpolate gem positions
   _interpolateGuestGems(prevState.gm, currState.gm, scene, t);
 }
 
 function _applyPlayerState(playerObj, s, interpolationFactor) {
-  // Apply state directly (interpolation happens separately in _interpolatePlayerState)
   playerObj.mesh.position.x = s.x;
   playerObj.mesh.position.z = s.z;
   playerObj.mesh.position.y = PLAYER_SIZE * 0.9;
@@ -583,11 +593,9 @@ function _applyPlayerState(playerObj, s, interpolationFactor) {
   playerObj.level = s.lv;
   playerObj.alive = s.al;
 
-  // Handle visibility (alive, invincibility flash, dead)
   if (!s.al) {
-    playerObj.mesh.visible = true; // Show dead player body
+    playerObj.mesh.visible = true;
   } else if (s.inv) {
-    // Flash using time-based toggle
     playerObj.mesh.visible = Math.floor(performance.now() / 100) % 2 === 0;
   } else {
     playerObj.mesh.visible = true;
@@ -595,25 +603,22 @@ function _applyPlayerState(playerObj, s, interpolationFactor) {
 }
 
 function _interpolatePlayerState(playerObj, prevS, currS, t) {
-  // Interpolate position between previous and current state
   playerObj.mesh.position.x = prevS.x + (currS.x - prevS.x) * t;
   playerObj.mesh.position.z = prevS.z + (currS.z - prevS.z) * t;
 
-  // Interpolate rotation (handle wrap-around)
   let rotDiff = currS.fa - prevS.fa;
   if (rotDiff > Math.PI) rotDiff -= Math.PI * 2;
   if (rotDiff < -Math.PI) rotDiff += Math.PI * 2;
   playerObj.mesh.rotation.y = prevS.fa + rotDiff * t;
 
   playerObj.mesh.position.y = PLAYER_SIZE * 0.9;
-  playerObj.facingAngle = currS.fa; // Use current state for non-interpolated values
+  playerObj.facingAngle = currS.fa;
   playerObj.hp = currS.hp;
   playerObj.maxHp = currS.mhp;
   playerObj.xp = currS.xp;
   playerObj.level = currS.lv;
   playerObj.alive = currS.al;
 
-  // Handle visibility
   if (!currS.al) {
     playerObj.mesh.visible = true;
   } else if (currS.inv) {
@@ -631,7 +636,6 @@ function _syncGuestEnemies(enemyStates, scene, interpolationFactor) {
 
     let entry = _guestEnemyMap.get(es.id);
     if (!entry) {
-      // Create new enemy visual
       const { group, anim } = createEnemyModel(es.tk, es.sz);
       scene.add(group);
       entry = {
@@ -645,12 +649,10 @@ function _syncGuestEnemies(enemyStates, scene, interpolationFactor) {
       _guestEnemyMap.set(es.id, entry);
     }
 
-    // Apply position directly (interpolation happens separately in _interpolateGuestEnemies)
     entry.mesh.position.set(es.x, es.y, es.z);
     entry.mesh.rotation.y = es.ry;
     entry.mesh.visible = true;
 
-    // Flash effect
     if (es.fl > 0) {
       flashGroup(entry.mesh);
     } else {
@@ -658,7 +660,6 @@ function _syncGuestEnemies(enemyStates, scene, interpolationFactor) {
     }
   }
 
-  // Remove enemies that no longer exist
   for (const [id, entry] of _guestEnemyMap) {
     if (!activeIds.has(id)) {
       entry.mesh.visible = false;
@@ -672,7 +673,6 @@ function _interpolateGuestEnemies(prevEnemyStates, currEnemyStates, scene, t) {
   const activeIds = new Set();
   const prevEnemyMap = new Map();
 
-  // Build map of previous enemy states
   for (const es of prevEnemyStates) {
     prevEnemyMap.set(es.id, es);
   }
@@ -684,16 +684,13 @@ function _interpolateGuestEnemies(prevEnemyStates, currEnemyStates, scene, t) {
 
     const prevEs = prevEnemyMap.get(es.id);
     if (!prevEs) {
-      // New enemy, use current position
       entry.mesh.position.set(es.x, es.y, es.z);
       entry.mesh.rotation.y = es.ry;
     } else {
-      // Interpolate position between previous and current
       entry.mesh.position.x = prevEs.x + (es.x - prevEs.x) * t;
       entry.mesh.position.y = prevEs.y + (es.y - prevEs.y) * t;
       entry.mesh.position.z = prevEs.z + (es.z - prevEs.z) * t;
 
-      // Interpolate rotation
       let rotDiff = es.ry - prevEs.ry;
       if (rotDiff > Math.PI) rotDiff -= Math.PI * 2;
       if (rotDiff < -Math.PI) rotDiff += Math.PI * 2;
@@ -702,7 +699,6 @@ function _interpolateGuestEnemies(prevEnemyStates, currEnemyStates, scene, t) {
 
     entry.mesh.visible = true;
 
-    // Flash effect (use current state)
     if (es.fl > 0) {
       flashGroup(entry.mesh);
     } else {
@@ -710,7 +706,6 @@ function _interpolateGuestEnemies(prevEnemyStates, currEnemyStates, scene, t) {
     }
   }
 
-  // Hide enemies that no longer exist
   for (const [id, entry] of _guestEnemyMap) {
     if (!activeIds.has(id)) {
       entry.mesh.visible = false;
@@ -718,7 +713,6 @@ function _interpolateGuestEnemies(prevEnemyStates, currEnemyStates, scene, t) {
   }
 }
 
-// Continuously animate guest enemies (called every frame)
 function _animateGuestEnemies(localTime) {
   for (const [id, entry] of _guestEnemyMap) {
     if (entry.mesh.visible) {
@@ -732,7 +726,6 @@ function _animateGuestEnemies(localTime) {
 }
 
 function _syncGuestProjectiles(projStates, scene, interpolationFactor) {
-  // Grow pool if needed
   while (_guestProjectiles.length < projStates.length) {
     const geo = new THREE.SphereGeometry(0.15, 6, 6);
     const mat = new THREE.MeshBasicMaterial({ color: 0x44ccff });
@@ -741,13 +734,11 @@ function _syncGuestProjectiles(projStates, scene, interpolationFactor) {
     _guestProjectiles.push(mesh);
   }
 
-  // Apply positions directly (interpolation happens separately)
   for (let i = 0; i < projStates.length; i++) {
     _guestProjectiles[i].position.set(projStates[i].x, 0.8, projStates[i].z);
     _guestProjectiles[i].visible = true;
   }
 
-  // Hide extra
   for (let i = projStates.length; i < _guestProjectiles.length; i++) {
     _guestProjectiles[i].visible = false;
   }
@@ -766,10 +757,8 @@ function _interpolateGuestProjectiles(
     const currP = currProjStates[i];
 
     if (!prevP) {
-      // New projectile, use current position
       proj.position.set(currP.x, 0.8, currP.z);
     } else {
-      // Interpolate between previous and current
       proj.position.x = prevP.x + (currP.x - prevP.x) * t;
       proj.position.z = prevP.z + (currP.z - prevP.z) * t;
       proj.position.y = 0.8;
@@ -778,7 +767,6 @@ function _interpolateGuestProjectiles(
 }
 
 function _syncGuestGems(gemStates, scene, interpolationFactor) {
-  // Grow pool if needed
   while (_guestGems.length < gemStates.length) {
     const geo = new THREE.OctahedronGeometry(0.15, 0);
     const mat = new THREE.MeshStandardMaterial({
@@ -793,14 +781,12 @@ function _syncGuestGems(gemStates, scene, interpolationFactor) {
     _guestGems.push(mesh);
   }
 
-  // Apply positions directly (interpolation happens separately)
   for (let i = 0; i < gemStates.length; i++) {
     const g = gemStates[i];
     _guestGems[i].position.set(g.x, g.y, g.z);
     _guestGems[i].visible = true;
   }
 
-  // Hide extra
   for (let i = gemStates.length; i < _guestGems.length; i++) {
     _guestGems[i].visible = false;
   }
@@ -814,10 +800,8 @@ function _interpolateGuestGems(prevGemStates, currGemStates, scene, t) {
     const currG = currGemStates[i];
 
     if (!prevG) {
-      // New gem, use current position
       gem.position.set(currG.x, currG.y, currG.z);
     } else {
-      // Interpolate between previous and current
       gem.position.x = prevG.x + (currG.x - prevG.x) * t;
       gem.position.y = prevG.y + (currG.y - prevG.y) * t;
       gem.position.z = prevG.z + (currG.z - prevG.z) * t;
@@ -825,11 +809,10 @@ function _interpolateGuestGems(prevGemStates, currGemStates, scene, t) {
   }
 }
 
-// Continuously animate guest gems (called every frame)
 function _animateGuestGems(delta) {
   for (const gem of _guestGems) {
     if (gem.visible) {
-      gem.rotation.y += delta * 2; // Smooth rotation
+      gem.rotation.y += delta * 2;
     }
   }
 }
@@ -848,32 +831,36 @@ function _setupNetworkHandlers() {
 
 function _handleHostMessage(msg) {
   switch (msg.type) {
-    case "input":
-      // Guest sends their movement input
-      _remoteInput.x = msg.mx || 0;
-      _remoteInput.z = msg.mz || 0;
-      break;
-
-    case "upgrade_pick":
-      // Guest picked an upgrade for player 2
-      if (
-        _pendingP2Choices &&
-        msg.index >= 0 &&
-        msg.index < _pendingP2Choices.length
-      ) {
-        applyUpgradeChoice(_pendingP2Choices[msg.index], player2);
-        _pendingP2Choices = null;
-        gameState.paused = false;
-        send({ type: "upgrade_done" });
+    case "input": {
+      // Guest sends their movement input with playerIndex
+      const pi = msg.pi;
+      if (_remoteInputs[pi]) {
+        _remoteInputs[pi].x = msg.mx || 0;
+        _remoteInputs[pi].z = msg.mz || 0;
       }
       break;
+    }
+
+    case "upgrade_pick": {
+      // Guest picked an upgrade for their player
+      const pi = msg.playerIndex;
+      const pending = _pendingUpgradeChoices[pi];
+      if (pending && msg.index >= 0 && msg.index < pending.length) {
+        const arrayIdx = _gamePlayerIndices.indexOf(pi);
+        if (arrayIdx >= 0 && arrayIdx < players.length) {
+          applyUpgradeChoice(pending[msg.index], players[arrayIdx]);
+        }
+        delete _pendingUpgradeChoices[pi];
+        send({ type: "upgrade_done", playerIndex: pi });
+      }
+      break;
+    }
   }
 }
 
 function _handleGuestMessage(msg) {
   switch (msg.type) {
-    case "state":
-      // Store state and apply immediately for responsiveness
+    case "state": {
       const now = performance.now();
       if (_currentHostState) {
         _previousHostState = _deepCloneState(_currentHostState);
@@ -882,26 +869,35 @@ function _handleGuestMessage(msg) {
       _currentHostState = _deepCloneState(msg);
       _currentStateTime = now;
 
-      // Apply state immediately when received (don't wait for next frame)
-      // This reduces perceived lag
       if (gameState.scene) {
         _applyHostState(_currentHostState, gameState.scene, 1.0);
       }
       break;
+    }
 
-    case "upgrade_show":
-      // Host says player 2 leveled up, show choices
-      gameState.paused = true;
-      showUpgradeMenuUI(msg.choices, "Player 2", (index) => {
-        send({ type: "upgrade_pick", index });
+    case "upgrade_show": {
+      // Only show if this upgrade is for our player
+      if (msg.playerIndex === getPlayerIndex()) {
+        const arrayIdx = _gamePlayerIndices.indexOf(msg.playerIndex);
+        const playerLabel = `Player ${arrayIdx + 1}`;
+        showUpgradeMenuUI(msg.choices, playerLabel, (index) => {
+          send({
+            type: "upgrade_pick",
+            playerIndex: getPlayerIndex(),
+            index,
+          });
+          hideUpgradeMenu();
+        });
+      }
+      break;
+    }
+
+    case "upgrade_done": {
+      if (msg.playerIndex === getPlayerIndex()) {
         hideUpgradeMenu();
-      });
+      }
       break;
-
-    case "upgrade_done":
-      // Host confirmed the upgrade was applied
-      hideUpgradeMenu();
-      break;
+    }
 
     case "game_over":
       gameState.gameOver = true;
@@ -913,21 +909,28 @@ function _handleGuestMessage(msg) {
 // ---------- Level-Up Callback (Host Only) ----------
 
 function _onPlayerLevelUp(playerObj) {
-  if (playerObj === player1) {
+  const arrayIdx = players.indexOf(playerObj);
+  if (arrayIdx < 0) return;
+
+  const pi = _gamePlayerIndices[arrayIdx];
+  const playerLabel = `Player ${arrayIdx + 1}`;
+
+  if (pi === getPlayerIndex()) {
     // Host's own player leveled up — show menu locally
     const choices = generateUpgradeChoices(playerObj);
-    showUpgradeMenuUI(choices, "Player 1", (index) => {
-      applyUpgradeChoice(choices[index], player1);
+    showUpgradeMenuUI(choices, playerLabel, (index) => {
+      applyUpgradeChoice(choices[index], playerObj);
       hideUpgradeMenu();
     });
-  } else if (playerObj === player2) {
-    // Guest's player leveled up — send choices to guest
+  } else {
+    // Guest's player leveled up — send choices to that guest
     const choices = generateUpgradeChoices(playerObj);
-    _pendingP2Choices = choices;
+    _pendingUpgradeChoices[pi] = choices;
 
-    // Send serializable choices to guest
+    // Send serializable choices (broadcast to all guests; only the matching one shows it)
     send({
       type: "upgrade_show",
+      playerIndex: pi,
       choices: choices.map((c) => ({
         type: c.type,
         id: c.id,
@@ -935,8 +938,6 @@ function _onPlayerLevelUp(playerObj) {
         description: c.description,
       })),
     });
-
-    gameState.paused = true;
   }
 }
 
@@ -1007,7 +1008,13 @@ function _hideLoadingScreen() {
 
 let _lobbyOverlay = null;
 let _lobbyStatusEl = null;
+let _lobbyPlayerListEl = null;
+let _lobbyPlayerCountEl = null;
 
+/**
+ * Show the lobby overlay with HOST/JOIN buttons.
+ * Returns a promise that resolves with the assigned role.
+ */
 function _showLobby() {
   return new Promise((resolve) => {
     _lobbyOverlay = document.createElement("div");
@@ -1058,8 +1065,9 @@ function _showLobby() {
           ">CONNECT</button>
         </div>
       </div>
+      <div id="lobby-player-list-area" style="display: none; margin-bottom: 20px; min-width: 280px;"></div>
       <p id="lobby-status" style="color: #888; font-size: 16px; min-height: 24px;"></p>
-      <p style="color: #555; font-size: 13px; margin-top: 20px;">
+      <p id="lobby-server-hint" style="color: #555; font-size: 13px; margin-top: 20px;">
         Run <code style="background: #333; padding: 2px 6px; border-radius: 4px; color: #aaa;">npm run server</code>
         in a terminal first
       </p>
@@ -1112,15 +1120,13 @@ function _showLobby() {
 
       try {
         const role = await connect(hostIp || undefined);
-        _setLobbyStatus(
-          role === "host"
-            ? "Connected as Host (Player 1)"
-            : "Connected as Guest (Player 2)",
-        );
         // Hide buttons and IP input
         const btns = _lobbyOverlay.querySelector("#lobby-buttons");
         if (btns) btns.style.display = "none";
         ipInputArea.style.display = "none";
+        // Hide server hint
+        const hint = _lobbyOverlay.querySelector("#lobby-server-hint");
+        if (hint) hint.style.display = "none";
         resolve(role);
       } catch (err) {
         _setLobbyStatus(
@@ -1136,7 +1142,7 @@ function _showLobby() {
       }
     };
 
-    // HOST: connect to localhost (this machine is the server)
+    // HOST: connect to localhost
     hostBtn.addEventListener("click", () => doConnect(null));
 
     // JOIN: show IP input field
@@ -1166,6 +1172,157 @@ function _showLobby() {
   });
 }
 
+/**
+ * Show lobby waiting screen for host: player list + START button.
+ * Returns a promise resolving with { seed, playerIndices } when START is clicked.
+ */
+function _showLobbyWaitingHost() {
+  return new Promise((resolve) => {
+    // Show player list area
+    const playerListArea = _lobbyOverlay.querySelector(
+      "#lobby-player-list-area",
+    );
+    playerListArea.style.display = "block";
+
+    // Create player list container
+    _lobbyPlayerListEl = document.createElement("div");
+    _lobbyPlayerListEl.style.cssText = `
+      background: rgba(0,0,0,0.3); border-radius: 10px; padding: 16px;
+      border: 1px solid rgba(255,255,255,0.1);
+    `;
+    playerListArea.appendChild(_lobbyPlayerListEl);
+
+    // Player count
+    _lobbyPlayerCountEl = document.createElement("div");
+    _lobbyPlayerCountEl.style.cssText = `
+      color: #888; font-size: 14px; text-align: center; margin-top: 10px;
+    `;
+    playerListArea.appendChild(_lobbyPlayerCountEl);
+
+    // START GAME button
+    const startBtn = document.createElement("button");
+    startBtn.textContent = "START GAME";
+    startBtn.style.cssText = `
+      padding: 16px 48px; font-size: 22px; cursor: pointer;
+      background: #44cc44; border: none; color: #fff; border-radius: 8px;
+      font-weight: bold; transition: background 0.2s; font-family: inherit;
+      margin-top: 16px; display: block;
+    `;
+    startBtn.addEventListener("mouseenter", () => {
+      startBtn.style.background = "#55dd55";
+    });
+    startBtn.addEventListener("mouseleave", () => {
+      startBtn.style.background = "#44cc44";
+    });
+    playerListArea.appendChild(startBtn);
+
+    _setLobbyStatus("You are the Host. Start the game when ready.");
+
+    // Register handler for player_list updates
+    onMessage((msg) => {
+      if (msg.type === "player_list") {
+        _lobbyPlayerIndices = msg.players;
+        _renderLobbyPlayerList();
+      }
+    });
+
+    // Render initial list (might be just us)
+    _renderLobbyPlayerList();
+
+    startBtn.addEventListener("click", () => {
+      const worldSeed = Math.floor(Math.random() * 2147483647);
+      const playerIndices = [..._lobbyPlayerIndices].sort((a, b) => a - b);
+      send({ type: "game_start", seed: worldSeed, playerIndices });
+      startBtn.disabled = true;
+      startBtn.style.opacity = "0.5";
+      _setLobbyStatus("Starting game...");
+      resolve({ seed: worldSeed, playerIndices });
+    });
+  });
+}
+
+/**
+ * Show lobby waiting screen for guest: player list + waiting message.
+ * Returns a promise resolving with { seed, playerIndices } when game_start is received.
+ */
+function _showLobbyWaitingGuest() {
+  return new Promise((resolve) => {
+    // Show player list area
+    const playerListArea = _lobbyOverlay.querySelector(
+      "#lobby-player-list-area",
+    );
+    playerListArea.style.display = "block";
+
+    // Create player list container
+    _lobbyPlayerListEl = document.createElement("div");
+    _lobbyPlayerListEl.style.cssText = `
+      background: rgba(0,0,0,0.3); border-radius: 10px; padding: 16px;
+      border: 1px solid rgba(255,255,255,0.1);
+    `;
+    playerListArea.appendChild(_lobbyPlayerListEl);
+
+    // Player count
+    _lobbyPlayerCountEl = document.createElement("div");
+    _lobbyPlayerCountEl.style.cssText = `
+      color: #888; font-size: 14px; text-align: center; margin-top: 10px;
+    `;
+    playerListArea.appendChild(_lobbyPlayerCountEl);
+
+    _setLobbyStatus("Waiting for host to start the game...");
+
+    // Register handler for player_list updates AND game_start
+    onMessage((msg) => {
+      if (msg.type === "player_list") {
+        _lobbyPlayerIndices = msg.players;
+        _renderLobbyPlayerList();
+      }
+      if (msg.type === "game_start") {
+        _setLobbyStatus("Game starting...");
+        resolve({ seed: msg.seed, playerIndices: msg.playerIndices });
+      }
+    });
+
+    // Render initial list
+    _renderLobbyPlayerList();
+  });
+}
+
+/**
+ * Re-render the lobby player list from _lobbyPlayerIndices.
+ */
+function _renderLobbyPlayerList() {
+  if (!_lobbyPlayerListEl) return;
+
+  const myIndex = getPlayerIndex();
+  const sorted = [..._lobbyPlayerIndices].sort((a, b) => a - b);
+
+  let html = `<div style="font-size: 14px; color: #aaa; margin-bottom: 10px; text-align: center; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;">Players in Lobby</div>`;
+
+  sorted.forEach((pi, i) => {
+    const color = PLAYER_HEX_COLORS[i % PLAYER_HEX_COLORS.length];
+    const isMe = pi === myIndex;
+    const isHostPlayer = pi === sorted[0]; // first connected is host (lowest index)
+    let label = `Player ${i + 1}`;
+    const tags = [];
+    if (isMe) tags.push("You");
+    if (isHostPlayer) tags.push("Host");
+    if (tags.length > 0) label += ` (${tags.join(" - ")})`;
+
+    html += `
+      <div style="display: flex; align-items: center; gap: 10px; padding: 6px 8px; ${isMe ? "background: rgba(255,255,255,0.05); border-radius: 6px;" : ""}">
+        <div style="width: 12px; height: 12px; border-radius: 50%; background: ${color}; box-shadow: 0 0 8px ${color}88;"></div>
+        <div style="color: ${isMe ? "#fff" : "#ccc"}; font-size: 16px; font-weight: ${isMe ? "bold" : "normal"};">${label}</div>
+      </div>
+    `;
+  });
+
+  _lobbyPlayerListEl.innerHTML = html;
+
+  if (_lobbyPlayerCountEl) {
+    _lobbyPlayerCountEl.textContent = `${sorted.length}/5 Players`;
+  }
+}
+
 function _setLobbyStatus(text) {
   if (_lobbyStatusEl) {
     _lobbyStatusEl.textContent = text;
@@ -1184,34 +1341,6 @@ function _hideLobby() {
   }
 }
 
-function _waitForGuest() {
-  return new Promise((resolve) => {
-    // Check if guest already joined
-    if (_guestConnected) {
-      resolve();
-      return;
-    }
-    const handler = (msg) => {
-      if (msg.type === "guest_join") {
-        _guestConnected = true;
-        resolve();
-      }
-    };
-    onMessage(handler);
-  });
-}
-
-function _waitForGameStart() {
-  return new Promise((resolve) => {
-    const handler = (msg) => {
-      if (msg.type === "game_start") {
-        resolve(msg.seed); // return the world seed from host
-      }
-    };
-    onMessage(handler);
-  });
-}
-
 function _delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1219,6 +1348,13 @@ function _delay(ms) {
 // ---------- Game Over Screen ----------
 
 function _showGameOver() {
+  const levelsHtml = players
+    .map((p, i) => {
+      const color = PLAYER_HEX_COLORS[i % PLAYER_HEX_COLORS.length];
+      return `<span style="color: ${color};">P${i + 1} Lv ${p.level}</span>`;
+    })
+    .join(" &nbsp;|&nbsp; ");
+
   const overlay = document.createElement("div");
   overlay.id = "game-over-overlay";
   overlay.innerHTML = `
@@ -1231,7 +1367,7 @@ function _showGameOver() {
       <h1 style="font-size: 64px; color: #ff4444; margin-bottom: 20px; text-shadow: 0 0 20px #ff0000;">GAME OVER</h1>
       <div style="font-size: 22px; margin-bottom: 8px;">Time Survived: <strong>${_formatTime(gameState.gameTime)}</strong></div>
       <div style="font-size: 22px; margin-bottom: 8px;">Enemies Killed: <strong>${gameState.totalKills}</strong></div>
-      <div style="font-size: 22px; margin-bottom: 8px;">P1 Level: <strong>${player1 ? player1.level : "?"}</strong> | P2 Level: <strong>${player2 ? player2.level : "?"}</strong></div>
+      <div style="font-size: 22px; margin-bottom: 8px;">${levelsHtml}</div>
       <button id="restart-btn" style="
         padding: 14px 48px; font-size: 22px; cursor: pointer;
         background: #ff4444; border: none; color: #fff; border-radius: 8px;

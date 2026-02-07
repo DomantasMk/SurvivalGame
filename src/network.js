@@ -4,6 +4,7 @@ const DEFAULT_PORT = 3001;
 
 let ws = null;
 let _role = null;
+let _playerIndex = -1;
 let _messageHandlers = [];
 let _connected = false;
 
@@ -54,8 +55,11 @@ export function connect(hostIp) {
 
       // Handle initial role assignment from server
       if (msg.type === "role") {
-        console.log(`[network] Assigned role: ${msg.role}`);
+        console.log(
+          `[network] Assigned role: ${msg.role}, playerIndex: ${msg.playerIndex}`,
+        );
         _role = msg.role;
+        _playerIndex = msg.playerIndex;
         succeed(msg.role);
         return;
       }
@@ -107,6 +111,10 @@ export function isGuest() {
 
 export function getRole() {
   return _role;
+}
+
+export function getPlayerIndex() {
+  return _playerIndex;
 }
 
 export function isConnected() {

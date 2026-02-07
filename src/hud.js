@@ -1,17 +1,32 @@
-// hud.js — HTML overlay: HP bars for both players, XP bar, timer, kill count
+// hud.js — HTML overlay: HP bars for N players, XP bar, timer, kill count
 
 import { getXpForNextLevel } from "./xpManager.js";
 
 let container;
-let p1HpBar, p1HpText;
-let p2HpBar, p2HpText;
 let xpBar, levelText;
 let timerText, killText;
 
+// Dynamic arrays for N player HP bars
+const _hpBars = []; // { bar, text } per player
+let _playerCount = 0;
+
+// Gradient color pairs for HP bars (darker, lighter) per player color
+const BAR_GRADIENTS = [
+  ["#3366cc", "#4488ff"], // blue
+  ["#cc3333", "#ff4444"], // red
+  ["#33aa33", "#44cc44"], // green
+  ["#7733aa", "#aa44ff"], // purple
+  ["#cc6600", "#ff8800"], // orange
+];
+
 /**
- * Create HUD elements for two-player display.
+ * Create HUD elements for N-player display.
+ * @param {number} playerCount - Number of players
+ * @param {string[]} hexColors - Array of hex color strings for each player
  */
-export function createHud() {
+export function createHud(playerCount, hexColors) {
+  _playerCount = playerCount;
+
   container = document.createElement("div");
   container.id = "hud";
   container.style.cssText = `
@@ -23,7 +38,7 @@ export function createHud() {
     padding: 12px 16px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
   `;
 
   // Top row: timer and kill count
@@ -42,81 +57,50 @@ export function createHud() {
   topRow.appendChild(killText);
   container.appendChild(topRow);
 
-  // --- Player 1 HP Bar ---
-  const p1Row = document.createElement("div");
-  p1Row.style.cssText = `display: flex; align-items: center; gap: 8px;`;
+  // --- Dynamic Player HP Bars ---
+  for (let i = 0; i < playerCount; i++) {
+    const color = hexColors[i % hexColors.length];
+    const gradient = BAR_GRADIENTS[i % BAR_GRADIENTS.length];
 
-  const p1Label = document.createElement("div");
-  p1Label.style.cssText = `color: #4488ff; font-size: 12px; font-weight: bold; text-shadow: 0 1px 2px #000; min-width: 20px;`;
-  p1Label.textContent = "P1";
-  p1Row.appendChild(p1Label);
+    const row = document.createElement("div");
+    row.style.cssText = `display: flex; align-items: center; gap: 8px;`;
 
-  const p1HpContainer = document.createElement("div");
-  p1HpContainer.style.cssText = `
-    width: 220px; height: 16px;
-    background: rgba(0,0,0,0.5);
-    border-radius: 8px; overflow: hidden;
-    position: relative;
-    border: 1px solid rgba(68,136,255,0.3);
-  `;
+    const label = document.createElement("div");
+    label.style.cssText = `color: ${color}; font-size: 12px; font-weight: bold; text-shadow: 0 1px 2px #000; min-width: 20px;`;
+    label.textContent = `P${i + 1}`;
+    row.appendChild(label);
 
-  p1HpBar = document.createElement("div");
-  p1HpBar.style.cssText = `
-    height: 100%; width: 100%;
-    background: linear-gradient(90deg, #3366cc, #4488ff);
-    border-radius: 8px;
-    transition: width 0.15s;
-  `;
-  p1HpContainer.appendChild(p1HpBar);
+    const hpContainer = document.createElement("div");
+    hpContainer.style.cssText = `
+      width: 200px; height: 14px;
+      background: rgba(0,0,0,0.5);
+      border-radius: 8px; overflow: hidden;
+      position: relative;
+      border: 1px solid ${color}44;
+    `;
 
-  p1HpText = document.createElement("div");
-  p1HpText.style.cssText = `
-    position: absolute; inset: 0;
-    display: flex; align-items: center; justify-content: center;
-    color: #fff; font-size: 10px; font-weight: bold;
-    text-shadow: 0 1px 2px #000;
-  `;
-  p1HpContainer.appendChild(p1HpText);
-  p1Row.appendChild(p1HpContainer);
-  container.appendChild(p1Row);
+    const hpBar = document.createElement("div");
+    hpBar.style.cssText = `
+      height: 100%; width: 100%;
+      background: linear-gradient(90deg, ${gradient[0]}, ${gradient[1]});
+      border-radius: 8px;
+      transition: width 0.15s;
+    `;
+    hpContainer.appendChild(hpBar);
 
-  // --- Player 2 HP Bar ---
-  const p2Row = document.createElement("div");
-  p2Row.style.cssText = `display: flex; align-items: center; gap: 8px;`;
+    const hpText = document.createElement("div");
+    hpText.style.cssText = `
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 10px; font-weight: bold;
+      text-shadow: 0 1px 2px #000;
+    `;
+    hpContainer.appendChild(hpText);
+    row.appendChild(hpContainer);
+    container.appendChild(row);
 
-  const p2Label = document.createElement("div");
-  p2Label.style.cssText = `color: #ff4444; font-size: 12px; font-weight: bold; text-shadow: 0 1px 2px #000; min-width: 20px;`;
-  p2Label.textContent = "P2";
-  p2Row.appendChild(p2Label);
-
-  const p2HpContainer = document.createElement("div");
-  p2HpContainer.style.cssText = `
-    width: 220px; height: 16px;
-    background: rgba(0,0,0,0.5);
-    border-radius: 8px; overflow: hidden;
-    position: relative;
-    border: 1px solid rgba(255,68,68,0.3);
-  `;
-
-  p2HpBar = document.createElement("div");
-  p2HpBar.style.cssText = `
-    height: 100%; width: 100%;
-    background: linear-gradient(90deg, #cc3333, #ff4444);
-    border-radius: 8px;
-    transition: width 0.15s;
-  `;
-  p2HpContainer.appendChild(p2HpBar);
-
-  p2HpText = document.createElement("div");
-  p2HpText.style.cssText = `
-    position: absolute; inset: 0;
-    display: flex; align-items: center; justify-content: center;
-    color: #fff; font-size: 10px; font-weight: bold;
-    text-shadow: 0 1px 2px #000;
-  `;
-  p2HpContainer.appendChild(p2HpText);
-  p2Row.appendChild(p2HpContainer);
-  container.appendChild(p2Row);
+    _hpBars.push({ bar: hpBar, text: hpText });
+  }
 
   // --- XP Bar (for local player) ---
   const xpContainer = document.createElement("div");
@@ -151,26 +135,21 @@ export function createHud() {
 }
 
 /**
- * Update HUD with both players' info.
+ * Update HUD with all players' info.
  * @param {object} localPlayer - The local player (for XP bar)
- * @param {object} player1 - Player 1 object
- * @param {object} player2 - Player 2 object
+ * @param {Array} allPlayers - Array of all player objects
  * @param {object} gameState - Game state object
  */
-export function updateHud(localPlayer, player1, player2, gameState) {
-  // Player 1 HP
-  const p1HpPct = Math.max(0, (player1.hp / player1.maxHp) * 100);
-  p1HpBar.style.width = `${p1HpPct}%`;
-  p1HpText.textContent = player1.alive
-    ? `${Math.ceil(player1.hp)} / ${player1.maxHp}`
-    : "DEAD";
-
-  // Player 2 HP
-  const p2HpPct = Math.max(0, (player2.hp / player2.maxHp) * 100);
-  p2HpBar.style.width = `${p2HpPct}%`;
-  p2HpText.textContent = player2.alive
-    ? `${Math.ceil(player2.hp)} / ${player2.maxHp}`
-    : "DEAD";
+export function updateHud(localPlayer, allPlayers, gameState) {
+  // Update each player's HP bar
+  for (let i = 0; i < _hpBars.length && i < allPlayers.length; i++) {
+    const p = allPlayers[i];
+    const hpPct = Math.max(0, (p.hp / p.maxHp) * 100);
+    _hpBars[i].bar.style.width = `${hpPct}%`;
+    _hpBars[i].text.textContent = p.alive
+      ? `${Math.ceil(p.hp)} / ${p.maxHp}`
+      : "DEAD";
+  }
 
   // XP (local player)
   const needed = getXpForNextLevel(localPlayer.level);
