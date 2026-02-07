@@ -70,6 +70,14 @@ import {
   unflashGroup,
   animateEnemyModel,
 } from "./models.js";
+import {
+  createChestManager,
+  updateChests,
+  updateBuffVisuals,
+  getActiveChests,
+  createChestMesh,
+  BUFF_INFO,
+} from "./chestManager.js";
 
 // ---------- Game State ----------
 export const gameState = {
@@ -133,6 +141,7 @@ const _guestProjectileMap = new Map();
 const _guestEnemyProjectileMap = new Map();
 const _guestGemMap = new Map();
 const _guestWeaponVisualMap = new Map();
+const _guestChestMap = new Map();
 
 // ---------- Initialization ----------
 
@@ -311,6 +320,7 @@ async function init() {
     createWeaponManager();
     createXpManager(scene);
     createWaveDirector();
+    createChestManager(scene);
 
     // Register boss wave announcement
     onBossWave((waveNumber) => {
@@ -532,6 +542,19 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
     updateProjectiles(delta, enemies);
     updateEnemyProjectiles(delta, players);
     updateXpGems(delta, players);
+
+    // --- Chests & Buffs ---
+    const chestPickups = updateChests(delta, players, gameState.gameTime);
+    updateBuffVisuals(players, gameState.gameTime);
+    for (const pickup of chestPickups) {
+      _showBuffPickup(pickup.playerIndex, pickup.buffType);
+      send({
+        type: "buff_pickup",
+        pi: pickup.playerIndex,
+        bt: pickup.buffType,
+      });
+    }
+
     updateParticles(delta);
 
     if (!document.hidden) {
@@ -611,6 +634,9 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
           if (_currentHostState.wv) {
             _syncGuestWeaponVisuals(_currentHostState.wv, scene);
           }
+          if (_currentHostState.ch) {
+            _syncGuestChests(_currentHostState.ch, scene);
+          }
           // Apply game-state scalars
           gameState.gameTime = _currentHostState.gt;
           gameState.totalKills = _currentHostState.tk;
@@ -677,9 +703,11 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
       }
     }
 
-    // --- Continuously animate enemies and gems ---
+    // --- Continuously animate enemies, gems, chests, and buff visuals ---
     _animateGuestEnemies(_guestLocalTime);
     _animateGuestGems(delta);
+    _animateGuestChests(gameState.gameTime);
+    updateBuffVisuals(players, gameState.gameTime);
 
     // --- Camera follows local player (or spectated player if dead) ---
     _handleSpectatorInput();
@@ -752,6 +780,13 @@ function _sendGameState() {
       z: g.mesh.position.z,
     })),
     wv: getActiveVisualStates(players),
+    ch: getActiveChests().map((c) => ({
+      id: c.id,
+      x: c.mesh.position.x,
+      y: c.mesh.position.y,
+      z: c.mesh.position.z,
+      bt: c.buffType,
+    })),
     cw: gameState.currentWave,
     ba: gameState.bossActive,
     bh: gameState.bossHp,
@@ -771,6 +806,13 @@ function _serializePlayer(p) {
     lv: p.level,
     al: p.alive,
     inv: p.invincibilityTimer > 0,
+    bf: p.buffs
+      ? {
+          dp: p.buffs.doubleProjectiles,
+          sb: p.buffs.speedBoost,
+          ga: p.buffs.glowingArmor,
+        }
+      : null,
   };
 }
 
@@ -805,6 +847,7 @@ function _deepCloneState(state) {
         lv: p.lv,
         al: p.al,
         inv: p.inv,
+        bf: p.bf ? { dp: p.bf.dp, sb: p.bf.sb, ga: p.bf.ga } : null,
       };
     }
   }
@@ -871,6 +914,15 @@ function _deepCloneState(state) {
     }
   }
 
+  // Clone chest states
+  if (state.ch) {
+    clone.ch = new Array(state.ch.length);
+    for (let i = 0; i < state.ch.length; i++) {
+      const c = state.ch[i];
+      clone.ch[i] = { id: c.id, x: c.x, y: c.y, z: c.z, bt: c.bt };
+    }
+  }
+
   // Clone weapon visual states
   if (state.wv) {
     clone.wv = new Array(state.wv.length);
@@ -928,6 +980,11 @@ function _applyHostState(state, scene, interpolationFactor) {
     _syncGuestWeaponVisuals(state.wv, scene);
   }
 
+  // Sync chests
+  if (state.ch) {
+    _syncGuestChests(state.ch, scene);
+  }
+
   // Check game over
   if (state.go && !gameState.gameOver) {
     gameState.gameOver = true;
@@ -966,6 +1023,20 @@ function _applyPlayerState(playerObj, s, interpolationFactor) {
   playerObj.level = s.lv;
   playerObj.alive = s.al;
 
+  // Apply buff timers from host
+  if (s.bf) {
+    if (!playerObj.buffs) {
+      playerObj.buffs = {
+        doubleProjectiles: 0,
+        speedBoost: 0,
+        glowingArmor: 0,
+      };
+    }
+    playerObj.buffs.doubleProjectiles = s.bf.dp || 0;
+    playerObj.buffs.speedBoost = s.bf.sb || 0;
+    playerObj.buffs.glowingArmor = s.bf.ga || 0;
+  }
+
   if (!s.al) {
     // Dead: rotate to lie on the ground
     playerObj.mesh.rotation.x = -Math.PI / 2;
@@ -997,6 +1068,20 @@ function _interpolatePlayerState(playerObj, prevS, currS, t) {
   playerObj.xp = currS.xp;
   playerObj.level = currS.lv;
   playerObj.alive = currS.al;
+
+  // Apply buff timers from current state
+  if (currS.bf) {
+    if (!playerObj.buffs) {
+      playerObj.buffs = {
+        doubleProjectiles: 0,
+        speedBoost: 0,
+        glowingArmor: 0,
+      };
+    }
+    playerObj.buffs.doubleProjectiles = currS.bf.dp || 0;
+    playerObj.buffs.speedBoost = currS.bf.sb || 0;
+    playerObj.buffs.glowingArmor = currS.bf.ga || 0;
+  }
 
   if (!currS.al) {
     // Dead: rotate to lie on the ground
@@ -1305,6 +1390,61 @@ function _animateGuestGems(delta) {
   }
 }
 
+// ---------- Guest Chest Sync ----------
+
+function _syncGuestChests(chestStates, scene) {
+  const activeIds = new Set();
+
+  for (const cs of chestStates) {
+    activeIds.add(cs.id);
+
+    let entry = _guestChestMap.get(cs.id);
+    if (!entry) {
+      const result = createChestMesh(cs.bt);
+      scene.add(result.mesh);
+      entry = {
+        mesh: result.mesh,
+        glowMesh: result.glowMesh,
+        beaconMesh: result.beaconMesh,
+        buffType: cs.bt,
+      };
+      _guestChestMap.set(cs.id, entry);
+    }
+
+    entry.mesh.position.x = cs.x;
+    entry.mesh.position.z = cs.z;
+    entry.mesh.visible = true;
+  }
+
+  for (const [id, entry] of _guestChestMap) {
+    if (!activeIds.has(id)) {
+      scene.remove(entry.mesh);
+      entry.mesh.traverse((child) => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+      });
+      _guestChestMap.delete(id);
+    }
+  }
+}
+
+function _animateGuestChests(gameTime) {
+  for (const [id, entry] of _guestChestMap) {
+    if (entry.mesh.visible) {
+      entry.mesh.rotation.y += 0.02;
+      entry.mesh.position.y = 0.8 + Math.sin(gameTime * 2.5 + id * 1.7) * 0.2;
+      if (entry.glowMesh) {
+        entry.glowMesh.material.opacity =
+          0.12 + Math.sin(gameTime * 3 + id) * 0.06;
+      }
+      if (entry.beaconMesh) {
+        entry.beaconMesh.material.opacity =
+          0.08 + Math.sin(gameTime * 2 + id * 0.5) * 0.04;
+      }
+    }
+  }
+}
+
 // ---------- Guest Boss Indicator Sync ----------
 
 function _syncGuestBossIndicator(entry, es, scene) {
@@ -1534,6 +1674,10 @@ function _handleGuestMessage(msg) {
       }
       break;
     }
+
+    case "buff_pickup":
+      _showBuffPickup(msg.pi, msg.bt);
+      break;
 
     case "boss_wave":
       _showBossWaveAnnouncement(msg.wave);
@@ -2028,6 +2172,51 @@ function _showBossWaveAnnouncement(waveNumber) {
   `;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 3000);
+}
+
+// ---------- Buff Pickup Announcement ----------
+
+function _showBuffPickup(playerArrayIndex, buffType) {
+  const info = BUFF_INFO[buffType];
+  if (!info) return;
+
+  const color = PLAYER_HEX_COLORS[playerArrayIndex % PLAYER_HEX_COLORS.length];
+
+  // Add CSS animation if not already present
+  if (!document.getElementById("buff-pickup-style")) {
+    const style = document.createElement("style");
+    style.id = "buff-pickup-style";
+    style.textContent = `
+      @keyframes buffPickup {
+        0% { opacity: 0; transform: translateX(-50%) translateY(10px); }
+        20% { opacity: 1; transform: translateX(-50%) translateY(0); }
+        80% { opacity: 1; transform: translateX(-50%) translateY(0); }
+        100% { opacity: 0; transform: translateX(-50%) translateY(-20px); }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  const el = document.createElement("div");
+  el.style.cssText = `
+    position: fixed; top: 38%; left: 50%; transform: translateX(-50%);
+    z-index: 800; pointer-events: none;
+    animation: buffPickup 2s ease-out forwards;
+    text-align: center;
+  `;
+  el.innerHTML = `
+    <div style="font-size: 28px; font-weight: bold; color: ${info.color};
+      text-shadow: 0 0 15px ${info.color}88, 0 0 30px ${info.color}44;
+      font-family: 'Segoe UI', sans-serif; letter-spacing: 2px;">
+      ${info.name.toUpperCase()}!
+    </div>
+    <div style="font-size: 14px; color: ${color}; margin-top: 4px;
+      font-family: 'Segoe UI', sans-serif;">
+      Player ${playerArrayIndex + 1} &mdash; 60s
+    </div>
+  `;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2500);
 }
 
 // ---------- Game Over Screen ----------

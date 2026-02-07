@@ -79,6 +79,13 @@ export function createPlayer(scene, world, config = {}) {
     colorTheme,
     spawnX,
     spawnZ,
+
+    // Buff timers (managed by chestManager)
+    buffs: {
+      doubleProjectiles: 0,
+      speedBoost: 0,
+      glowingArmor: 0,
+    },
   };
 
   _animTimes.set(playerObj, 0);
@@ -102,11 +109,15 @@ export function updatePlayer(playerObj, delta, arenaHalf, inputVec) {
   animTime += delta;
   _animTimes.set(playerObj, animTime);
 
-  // --- Movement ---
+  // --- Movement (speed buff doubles movement speed) ---
+  const effectiveSpeed =
+    playerObj.buffs && playerObj.buffs.speedBoost > 0
+      ? playerObj.speed * 2
+      : playerObj.speed;
   _moveVec.set(
-    inputVec.x * playerObj.speed * delta,
+    inputVec.x * effectiveSpeed * delta,
     0,
-    inputVec.z * playerObj.speed * delta,
+    inputVec.z * effectiveSpeed * delta,
   );
 
   const pos = playerObj.mesh.position;
@@ -151,6 +162,7 @@ export function updatePlayer(playerObj, delta, arenaHalf, inputVec) {
 export function damagePlayer(playerObj, amount) {
   if (!playerObj.alive) return;
   if (playerObj.invincibilityTimer > 0) return;
+  if (playerObj.buffs && playerObj.buffs.glowingArmor > 0) return; // Glowing armor blocks all damage
 
   const effectiveDamage = Math.max(1, amount - playerObj.armor);
   playerObj.hp -= effectiveDamage;
@@ -182,6 +194,11 @@ export function resetPlayer(playerObj) {
   playerObj.kills = 0;
   playerObj.facingAngle = 0;
   playerObj.weapons = [];
+  playerObj.buffs = {
+    doubleProjectiles: 0,
+    speedBoost: 0,
+    glowingArmor: 0,
+  };
   _animTimes.set(playerObj, 0);
   if (playerObj.mesh) {
     playerObj.mesh.position.set(

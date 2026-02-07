@@ -6,6 +6,7 @@ let container;
 let xpBar, levelText;
 let timerText, killText, waveText;
 let bossBarContainer, bossBar, bossHpText;
+let buffContainer;
 
 // Dynamic arrays for N player HP bars
 const _hpBars = []; // { bar, text } per player
@@ -137,6 +138,13 @@ export function createHud(playerCount, hexColors) {
   xpContainer.appendChild(levelText);
   container.appendChild(xpContainer);
 
+  // --- Buff Indicators (row of colored pills showing active buffs) ---
+  buffContainer = document.createElement("div");
+  buffContainer.style.cssText = `
+    display: flex; gap: 6px; margin-top: 4px; min-height: 22px;
+  `;
+  container.appendChild(buffContainer);
+
   document.body.appendChild(container);
 
   // --- Boss HP Bar (centered at top, hidden by default) ---
@@ -223,6 +231,44 @@ export function updateHud(localPlayer, allPlayers, gameState) {
 
   // Kills (shared)
   killText.textContent = `Kills: ${gameState.totalKills}`;
+
+  // Active buff indicators
+  if (buffContainer && localPlayer.buffs) {
+    let buffHtml = "";
+    const buffEntries = [
+      {
+        key: "doubleProjectiles",
+        name: "Double Shot",
+        icon: "\u2726\u2726",
+        color: "#aa66ff",
+      },
+      {
+        key: "speedBoost",
+        name: "Speed",
+        icon: "\u00BB",
+        color: "#44ccff",
+      },
+      {
+        key: "glowingArmor",
+        name: "Armor",
+        icon: "\u25C6",
+        color: "#ffcc00",
+      },
+    ];
+    for (const b of buffEntries) {
+      const t = localPlayer.buffs[b.key];
+      if (t > 0) {
+        const secs = Math.ceil(t);
+        buffHtml += `<div style="
+          background: ${b.color}22; border: 1px solid ${b.color}66;
+          border-radius: 6px; padding: 2px 8px;
+          color: ${b.color}; font-size: 11px; font-weight: bold;
+          text-shadow: 0 1px 2px #000; white-space: nowrap;
+        ">${b.icon} ${b.name} ${secs}s</div>`;
+      }
+    }
+    buffContainer.innerHTML = buffHtml;
+  }
 
   // Boss HP bar
   if (bossBarContainer) {

@@ -157,7 +157,11 @@ function _fireMagicWand(weapon, stats, playerObj, enemiesList) {
   }
 
   // Find N nearest alive enemies without copying/sorting the entire array
-  const count = stats.projectileCount;
+  // Double projectiles buff doubles the projectile count
+  const count =
+    playerObj.buffs && playerObj.buffs.doubleProjectiles > 0
+      ? stats.projectileCount * 2
+      : stats.projectileCount;
   _nearestBuf.length = 0;
 
   const px = playerObj.mesh.position.x;
