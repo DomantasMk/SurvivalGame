@@ -16,6 +16,9 @@ const BOSS_INTERVAL = 360; // 6 minutes
 const SPAWN_DISTANCE_MIN = 18;
 const SPAWN_DISTANCE_MAX = 25;
 
+// Arena bounds (must match ARENA_HALF in main.js)
+const ARENA_HALF = 50;
+
 export function createWaveDirector() {
   spawnTimer = 0;
   bossTimer = 0;
@@ -56,6 +59,53 @@ export function updateWaveDirector(delta, players) {
   }
 }
 
+/**
+ * Check if a spawn position is far enough from all alive players.
+ * @returns {boolean} true if the position is safe to spawn at
+ */
+function _isSafeSpawn(x, z, alivePlayers, minDist) {
+  for (const p of alivePlayers) {
+    const dx = p.mesh.position.x - x;
+    const dz = p.mesh.position.z - z;
+    if (dx * dx + dz * dz < minDist * minDist) return false;
+  }
+  return true;
+}
+
+/**
+ * Generate a spawn position around (px, pz) that is safe from all alive players.
+ * Retries up to MAX_RETRIES times; falls back to last attempted position.
+ */
+const MAX_SPAWN_RETRIES = 8;
+
+function _safeSpawnPosition(px, pz, alivePlayers, minDist, maxDist) {
+  for (let attempt = 0; attempt < MAX_SPAWN_RETRIES; attempt++) {
+    const angle = randomRange(0, Math.PI * 2);
+    const dist = randomRange(minDist, maxDist);
+    const x = Math.max(
+      -ARENA_HALF,
+      Math.min(ARENA_HALF, px + Math.cos(angle) * dist),
+    );
+    const z = Math.max(
+      -ARENA_HALF,
+      Math.min(ARENA_HALF, pz + Math.sin(angle) * dist),
+    );
+    if (_isSafeSpawn(x, z, alivePlayers, SPAWN_DISTANCE_MIN)) return { x, z };
+  }
+  // Fallback: spawn at max distance in a random direction from center
+  const angle = randomRange(0, Math.PI * 2);
+  return {
+    x: Math.max(
+      -ARENA_HALF,
+      Math.min(ARENA_HALF, px + Math.cos(angle) * maxDist),
+    ),
+    z: Math.max(
+      -ARENA_HALF,
+      Math.min(ARENA_HALF, pz + Math.sin(angle) * maxDist),
+    ),
+  };
+}
+
 function _spawnWave(players, count, time) {
   // Spawn around a random alive player (or center if none)
   const alivePlayers = players.filter((p) => p.alive);
@@ -67,10 +117,13 @@ function _spawnWave(players, count, time) {
   const pz = target ? target.mesh.position.z : 0;
 
   for (let i = 0; i < count; i++) {
-    const angle = randomRange(0, Math.PI * 2);
-    const dist = randomRange(SPAWN_DISTANCE_MIN, SPAWN_DISTANCE_MAX);
-    const x = px + Math.cos(angle) * dist;
-    const z = pz + Math.sin(angle) * dist;
+    const { x, z } = _safeSpawnPosition(
+      px,
+      pz,
+      alivePlayers,
+      SPAWN_DISTANCE_MIN,
+      SPAWN_DISTANCE_MAX,
+    );
 
     // Choose enemy type based on game time
     let type = "bat";
@@ -98,9 +151,14 @@ function _spawnBoss(players) {
       : null;
   const px = target ? target.mesh.position.x : 0;
   const pz = target ? target.mesh.position.z : 0;
-  const angle = randomRange(0, Math.PI * 2);
-  const dist = SPAWN_DISTANCE_MAX;
-  spawnEnemy("boss", px + Math.cos(angle) * dist, pz + Math.sin(angle) * dist);
+  const { x: bx, z: bz } = _safeSpawnPosition(
+    px,
+    pz,
+    alivePlayers,
+    SPAWN_DISTANCE_MAX,
+    SPAWN_DISTANCE_MAX + 5,
+  );
+  spawnEnemy("boss", bx, bz);
 }
 
 export function resetWaveDirector() {
