@@ -1,0 +1,16 @@
+{
+  "name": "vampiresurvivor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.19.3",
+    "three": "^0.182.0",
+    "vite": "^6.4.1"
+  }
+}
