@@ -48,6 +48,7 @@ import {
 import { updateParticles } from "./particles.js";
 import { getMovementVector } from "./input.js";
 import { connect, send, onMessage, isHost, isGuest } from "./network.js";
+import { createSeededRandom } from "./utils.js";
 import {
   createEnemyModel,
   flashGroup,
@@ -168,55 +169,7 @@ async function init() {
   gridHelper.position.y = 0.01;
   scene.add(gridHelper);
 
-  // --- Arena Decorations (rocks, dead trees) ---
-  const decorGeo = [
-    new THREE.DodecahedronGeometry(0.4, 0),
-    new THREE.DodecahedronGeometry(0.6, 0),
-    new THREE.DodecahedronGeometry(0.3, 0),
-  ];
-  const decorMat = new THREE.MeshStandardMaterial({
-    color: 0x3a3a3a,
-    roughness: 0.9,
-    metalness: 0.1,
-  });
-  const treeMat = new THREE.MeshStandardMaterial({
-    color: 0x2a1a0a,
-    roughness: 0.8,
-    metalness: 0.1,
-  });
-
-  for (let i = 0; i < 60; i++) {
-    const x = (Math.random() - 0.5) * ARENA_SIZE * 0.9;
-    const z = (Math.random() - 0.5) * ARENA_SIZE * 0.9;
-
-    if (Math.random() < 0.6) {
-      const geo = decorGeo[Math.floor(Math.random() * decorGeo.length)];
-      const rock = new THREE.Mesh(geo, decorMat);
-      rock.position.set(x, 0.2, z);
-      rock.rotation.set(Math.random(), Math.random(), Math.random());
-      rock.castShadow = true;
-      rock.receiveShadow = true;
-      scene.add(rock);
-    } else {
-      const trunk = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.15, 0.2, 1.2, 6),
-        treeMat,
-      );
-      trunk.position.set(x, 0.6, z);
-      trunk.castShadow = true;
-      scene.add(trunk);
-
-      for (let b = 0; b < 2; b++) {
-        const branch = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.04, 0.06, 0.5, 4),
-          treeMat,
-        );
-        branch.position.set(0, 0.2 + b * 0.3, 0);
-        branch.rotation.z = (Math.random() - 0.5) * 1.2;
-        trunk.add(branch);
-      }
-    }
-  }
+  // --- Arena Decorations are generated after networking (seeded for sync) ---
 
   // --- Ground Collider (Rapier) ---
   const groundColliderDesc = RAPIER.ColliderDesc.cuboid(
@@ -272,15 +225,20 @@ async function init() {
   gameState.role = role;
 
   // --- Wait for both players ---
+  let worldSeed;
   if (isHost()) {
     _setLobbyStatus("Waiting for Player 2 to join...");
     await _waitForGuest();
     _setLobbyStatus("Player 2 connected! Starting game...");
+    worldSeed = Math.floor(Math.random() * 2147483647);
     await _delay(500);
   } else {
     _setLobbyStatus("Connected as Guest! Waiting for host to start...");
-    await _waitForGameStart();
+    worldSeed = await _waitForGameStart(); // receives seed from host
   }
+
+  // --- Generate arena decorations using shared seed ---
+  _generateDecorations(scene, worldSeed);
 
   // --- Hide lobby ---
   _hideLobby();
@@ -320,9 +278,9 @@ async function init() {
   // --- Setup network message handlers ---
   _setupNetworkHandlers();
 
-  // --- Host signals game start ---
+  // --- Host signals game start (includes seed so guest generates same world) ---
   if (isHost()) {
-    send({ type: "game_start" });
+    send({ type: "game_start", seed: worldSeed });
   }
 
   // --- Handle Window Resize ---
@@ -982,6 +940,61 @@ function _onPlayerLevelUp(playerObj) {
   }
 }
 
+// ---------- Seeded Arena Decoration Generation ----------
+
+function _generateDecorations(scene, seed) {
+  const rng = createSeededRandom(seed);
+
+  const decorGeo = [
+    new THREE.DodecahedronGeometry(0.4, 0),
+    new THREE.DodecahedronGeometry(0.6, 0),
+    new THREE.DodecahedronGeometry(0.3, 0),
+  ];
+  const decorMat = new THREE.MeshStandardMaterial({
+    color: 0x3a3a3a,
+    roughness: 0.9,
+    metalness: 0.1,
+  });
+  const treeMat = new THREE.MeshStandardMaterial({
+    color: 0x2a1a0a,
+    roughness: 0.8,
+    metalness: 0.1,
+  });
+
+  for (let i = 0; i < 60; i++) {
+    const x = (rng() - 0.5) * ARENA_SIZE * 0.9;
+    const z = (rng() - 0.5) * ARENA_SIZE * 0.9;
+
+    if (rng() < 0.6) {
+      const geo = decorGeo[Math.floor(rng() * decorGeo.length)];
+      const rock = new THREE.Mesh(geo, decorMat);
+      rock.position.set(x, 0.2, z);
+      rock.rotation.set(rng(), rng(), rng());
+      rock.castShadow = true;
+      rock.receiveShadow = true;
+      scene.add(rock);
+    } else {
+      const trunk = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.15, 0.2, 1.2, 6),
+        treeMat,
+      );
+      trunk.position.set(x, 0.6, z);
+      trunk.castShadow = true;
+      scene.add(trunk);
+
+      for (let b = 0; b < 2; b++) {
+        const branch = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.04, 0.06, 0.5, 4),
+          treeMat,
+        );
+        branch.position.set(0, 0.2 + b * 0.3, 0);
+        branch.rotation.z = (rng() - 0.5) * 1.2;
+        trunk.add(branch);
+      }
+    }
+  }
+}
+
 // ---------- Lobby UI ----------
 
 function _hideLoadingScreen() {
@@ -1192,7 +1205,7 @@ function _waitForGameStart() {
   return new Promise((resolve) => {
     const handler = (msg) => {
       if (msg.type === "game_start") {
-        resolve();
+        resolve(msg.seed); // return the world seed from host
       }
     };
     onMessage(handler);
