@@ -1,4 +1,4 @@
-// weaponManager.js — Auto-fire weapon system, weapon definitions
+// weaponManager.js — Auto-fire weapon system, per-player weapon sets
 
 import * as THREE from "three";
 import { magicWand } from "./weapons/magicWand.js";
@@ -18,32 +18,30 @@ export const WEAPON_DEFS = {
   holyWater,
 };
 
-// Currently equipped weapons (array of { id, level, cooldownTimer, visualMesh? })
-export const equippedWeapons = [];
-
 const MAX_WEAPON_SLOTS = 6;
 
-// Temporary visuals for melee/area weapons
+// Temporary visuals for melee/area weapons (shared across all players)
 const _activeVisuals = [];
 
-let scene;
-
 export function createWeaponManager() {
-  // Scene ref is obtained from gameState
+  // No module-level state needed anymore
 }
 
-export function addWeapon(weaponId) {
-  if (equippedWeapons.length >= MAX_WEAPON_SLOTS) return false;
+/**
+ * Add a weapon to a player's weapon set, or level it up if already equipped.
+ */
+export function addWeapon(playerObj, weaponId) {
+  if (playerObj.weapons.length >= MAX_WEAPON_SLOTS) return false;
   if (!WEAPON_DEFS[weaponId]) return false;
 
   // Check if already equipped
-  const existing = equippedWeapons.find((w) => w.id === weaponId);
+  const existing = playerObj.weapons.find((w) => w.id === weaponId);
   if (existing) {
     // Level up instead
-    return levelUpWeapon(weaponId);
+    return levelUpWeapon(playerObj, weaponId);
   }
 
-  equippedWeapons.push({
+  playerObj.weapons.push({
     id: weaponId,
     level: 1,
     cooldownTimer: 0,
@@ -51,8 +49,11 @@ export function addWeapon(weaponId) {
   return true;
 }
 
-export function levelUpWeapon(weaponId) {
-  const weapon = equippedWeapons.find((w) => w.id === weaponId);
+/**
+ * Level up a specific weapon for a player.
+ */
+export function levelUpWeapon(playerObj, weaponId) {
+  const weapon = playerObj.weapons.find((w) => w.id === weaponId);
   if (!weapon) return false;
   const def = WEAPON_DEFS[weaponId];
   if (weapon.level >= def.maxLevel) return false;
@@ -60,15 +61,25 @@ export function levelUpWeapon(weaponId) {
   return true;
 }
 
-export function updateWeapons(delta, player, enemiesList) {
-  for (const weapon of equippedWeapons) {
+/**
+ * Update and fire weapons for a single player.
+ */
+export function updateWeapons(delta, playerObj, enemiesList) {
+  if (!playerObj.alive) return;
+
+  for (const weapon of playerObj.weapons) {
     weapon.cooldownTimer -= delta;
     if (weapon.cooldownTimer <= 0) {
-      _fireWeapon(weapon, player, enemiesList);
+      _fireWeapon(weapon, playerObj, enemiesList);
     }
   }
+}
 
-  // Update active visuals (melee arcs, auras, pools)
+/**
+ * Update active weapon visuals (melee arcs, auras, pools).
+ * Call once per frame, not per player.
+ */
+export function updateWeaponVisuals(delta, enemiesList) {
   for (let i = _activeVisuals.length - 1; i >= 0; i--) {
     const v = _activeVisuals[i];
     v.timer -= delta;
@@ -99,16 +110,16 @@ export function updateWeapons(delta, player, enemiesList) {
       if (v.mesh.material.opacity !== undefined) {
         v.mesh.material.opacity = Math.min(1, v.timer * 3);
       }
-      // Garlic aura follows player
-      if (v.type === "garlic") {
-        v.mesh.position.x = player.mesh.position.x;
-        v.mesh.position.z = player.mesh.position.z;
+      // Garlic aura follows the owner player
+      if (v.type === "garlic" && v.owner) {
+        v.mesh.position.x = v.owner.mesh.position.x;
+        v.mesh.position.z = v.owner.mesh.position.z;
       }
     }
   }
 }
 
-function _fireWeapon(weapon, player, enemiesList) {
+function _fireWeapon(weapon, playerObj, enemiesList) {
   const def = WEAPON_DEFS[weapon.id];
   const stats = def.getStats(weapon.level);
 
@@ -117,22 +128,22 @@ function _fireWeapon(weapon, player, enemiesList) {
 
   switch (weapon.id) {
     case "magicWand":
-      _fireMagicWand(weapon, stats, player, enemiesList);
+      _fireMagicWand(weapon, stats, playerObj, enemiesList);
       break;
     case "whip":
-      _fireWhip(weapon, stats, player, enemiesList);
+      _fireWhip(weapon, stats, playerObj, enemiesList);
       break;
     case "garlic":
-      _fireGarlic(weapon, stats, player, enemiesList);
+      _fireGarlic(weapon, stats, playerObj, enemiesList);
       break;
     case "holyWater":
-      _fireHolyWater(weapon, stats, player, enemiesList);
+      _fireHolyWater(weapon, stats, playerObj, enemiesList);
       break;
   }
 }
 
 // --- Magic Wand: fire projectile(s) toward nearest enemies ---
-function _fireMagicWand(weapon, stats, player, enemiesList) {
+function _fireMagicWand(weapon, stats, playerObj, enemiesList) {
   if (enemiesList.length === 0) {
     weapon.cooldownTimer = 0.2; // Retry quickly if no enemies
     return;
@@ -143,21 +154,21 @@ function _fireMagicWand(weapon, stats, player, enemiesList) {
     .filter((e) => e.alive)
     .sort(
       (a, b) =>
-        distXZ(a.mesh.position, player.mesh.position) -
-        distXZ(b.mesh.position, player.mesh.position),
+        distXZ(a.mesh.position, playerObj.mesh.position) -
+        distXZ(b.mesh.position, playerObj.mesh.position),
     );
 
   const count = stats.projectileCount;
   for (let i = 0; i < count && i < sorted.length; i++) {
     const target = sorted[i];
-    const dx = target.mesh.position.x - player.mesh.position.x;
-    const dz = target.mesh.position.z - player.mesh.position.z;
+    const dx = target.mesh.position.x - playerObj.mesh.position.x;
+    const dz = target.mesh.position.z - playerObj.mesh.position.z;
     const len = Math.sqrt(dx * dx + dz * dz);
     if (len < 0.01) continue;
 
     fireProjectile({
-      x: player.mesh.position.x,
-      z: player.mesh.position.z,
+      x: playerObj.mesh.position.x,
+      z: playerObj.mesh.position.z,
       dirX: dx / len,
       dirZ: dz / len,
       speed: stats.speed,
@@ -171,16 +182,16 @@ function _fireMagicWand(weapon, stats, player, enemiesList) {
 }
 
 // --- Whip: instant arc damage in front of player ---
-function _fireWhip(weapon, stats, player, enemiesList) {
-  const px = player.mesh.position.x;
-  const pz = player.mesh.position.z;
-  const angle = player.facingAngle;
+function _fireWhip(weapon, stats, playerObj, enemiesList) {
+  const px = playerObj.mesh.position.x;
+  const pz = playerObj.mesh.position.z;
+  const angle = playerObj.facingAngle;
   const area = stats.area;
 
   // Damage all enemies within area in front of player
   for (const e of enemiesList) {
     if (!e.alive) continue;
-    const d = distXZ(player.mesh.position, e.mesh.position);
+    const d = distXZ(playerObj.mesh.position, e.mesh.position);
     if (d > area) continue;
 
     // Check if enemy is roughly in front of player (180 degree arc)
@@ -219,15 +230,15 @@ function _fireWhip(weapon, stats, player, enemiesList) {
 }
 
 // --- Garlic: AoE aura around player ---
-function _fireGarlic(weapon, stats, player, enemiesList) {
-  const px = player.mesh.position.x;
-  const pz = player.mesh.position.z;
+function _fireGarlic(weapon, stats, playerObj, enemiesList) {
+  const px = playerObj.mesh.position.x;
+  const pz = playerObj.mesh.position.z;
   const area = stats.area;
 
   // Damage all enemies within radius
   for (const e of enemiesList) {
     if (!e.alive) continue;
-    const d = distXZ(player.mesh.position, e.mesh.position);
+    const d = distXZ(playerObj.mesh.position, e.mesh.position);
     if (d < area) {
       damageEnemy(e, stats.damage);
     }
@@ -246,21 +257,26 @@ function _fireGarlic(weapon, stats, player, enemiesList) {
   ringMesh.rotation.x = -Math.PI / 2;
   ringMesh.position.set(px, 0.3, pz);
   gameState.scene.add(ringMesh);
-  _activeVisuals.push({ mesh: ringMesh, timer: 0.3, type: "garlic" });
+  _activeVisuals.push({
+    mesh: ringMesh,
+    timer: 0.3,
+    type: "garlic",
+    owner: playerObj,
+  });
 }
 
 // --- Holy Water: damaging zone on the ground ---
-function _fireHolyWater(weapon, stats, player, enemiesList) {
+function _fireHolyWater(weapon, stats, playerObj, enemiesList) {
   // Drop at a random nearby position or on densest cluster
-  let tx = player.mesh.position.x;
-  let tz = player.mesh.position.z;
+  let tx = playerObj.mesh.position.x;
+  let tz = playerObj.mesh.position.z;
 
   // Aim at nearest enemy cluster or random if none
   if (enemiesList.length > 0) {
     const nearest = enemiesList.reduce((best, e) => {
       if (!e.alive) return best;
-      const d = distXZ(e.mesh.position, player.mesh.position);
-      return d < distXZ(best.mesh.position, player.mesh.position) ? e : best;
+      const d = distXZ(e.mesh.position, playerObj.mesh.position);
+      return d < distXZ(best.mesh.position, playerObj.mesh.position) ? e : best;
     });
     tx = nearest.mesh.position.x;
     tz = nearest.mesh.position.z;
@@ -298,9 +314,13 @@ function _fireHolyWater(weapon, stats, player, enemiesList) {
   });
 }
 
-export function resetWeapons() {
-  equippedWeapons.length = 0;
+export function resetWeapons(playerObj) {
+  if (playerObj) {
+    playerObj.weapons.length = 0;
+  }
+}
 
+export function resetAllWeaponVisuals() {
   for (const v of _activeVisuals) {
     gameState.scene.remove(v.mesh);
     if (v.mesh.geometry) v.mesh.geometry.dispose();

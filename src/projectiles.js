@@ -116,6 +116,13 @@ function _removeProjectile(index) {
   projectiles.splice(index, 1);
 }
 
+/**
+ * Get the active projectiles array (for state serialization).
+ */
+export function getActiveProjectiles() {
+  return projectiles;
+}
+
 export function resetProjectiles() {
   for (const p of projectiles) {
     p.mesh.visible = false;

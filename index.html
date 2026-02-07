@@ -75,21 +75,7 @@
       Collect gems to level up
     </div>
     <script type="module">
-      import("/src/main.js").then(() => {
-        // Hide loading screen after a short delay
-        setTimeout(() => {
-          const ls = document.getElementById("loading-screen");
-          if (ls) {
-            ls.style.opacity = "0";
-            setTimeout(() => ls.remove(), 500);
-          }
-        }, 300);
-        // Fade out controls hint
-        setTimeout(() => {
-          const hint = document.getElementById("controls-hint");
-          if (hint) hint.style.opacity = "0";
-        }, 8000);
-      });
+      import("/src/main.js");
     </script>
   </body>
 </html>

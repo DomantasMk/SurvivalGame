@@ -1,12 +1,7 @@
-// upgradeMenu.js — Level-up screen: pause game, show 3 random choices
+// upgradeMenu.js — Level-up screen: per-player upgrades with network support
 
 import { gameState } from "./main.js";
-import {
-  equippedWeapons,
-  WEAPON_DEFS,
-  addWeapon,
-  levelUpWeapon,
-} from "./weaponManager.js";
+import { WEAPON_DEFS, addWeapon, levelUpWeapon } from "./weaponManager.js";
 import { shuffle } from "./utils.js";
 
 let overlay = null;
@@ -20,41 +15,41 @@ const PASSIVE_UPGRADES = [
     id: "maxHp",
     name: "+20 Max HP",
     description: "Increases your maximum HP by 20 and heals you.",
-    apply(player) {
-      player.maxHp += 20;
-      player.hp = Math.min(player.hp + 20, player.maxHp);
+    apply(playerObj) {
+      playerObj.maxHp += 20;
+      playerObj.hp = Math.min(playerObj.hp + 20, playerObj.maxHp);
     },
   },
   {
     id: "speed",
     name: "+10% Speed",
     description: "Move faster.",
-    apply(player) {
-      player.speed *= 1.1;
+    apply(playerObj) {
+      playerObj.speed *= 1.1;
     },
   },
   {
     id: "pickup",
     name: "+30% Pickup Radius",
     description: "Collect XP gems from farther away.",
-    apply(player) {
-      player.pickupRadius *= 1.3;
+    apply(playerObj) {
+      playerObj.pickupRadius *= 1.3;
     },
   },
   {
     id: "armor",
     name: "+2 Armor",
     description: "Reduces all incoming damage.",
-    apply(player) {
-      player.armor += 2;
+    apply(playerObj) {
+      playerObj.armor += 2;
     },
   },
   {
     id: "heal",
     name: "Heal 30 HP",
     description: "Recover some health.",
-    apply(player) {
-      player.hp = Math.min(player.hp + 30, player.maxHp);
+    apply(playerObj) {
+      playerObj.hp = Math.min(playerObj.hp + 30, playerObj.maxHp);
     },
   },
 ];
@@ -78,29 +73,16 @@ export function isUpgradeMenuOpen() {
   return _isOpen;
 }
 
-export function showUpgradeMenu(player) {
-  _isOpen = true;
-  gameState.paused = true;
-
-  const choices = _generateChoices();
-  _renderChoices(choices, player);
-
-  overlay.style.display = "flex";
-}
-
-function _hideMenu() {
-  _isOpen = false;
-  gameState.paused = false;
-  overlay.style.display = "none";
-  overlay.innerHTML = "";
-}
-
-function _generateChoices() {
+/**
+ * Generate upgrade choices for a specific player.
+ * Returns an array of choice objects.
+ */
+export function generateUpgradeChoices(playerObj) {
   const options = [];
 
   // New weapons (if slots available)
-  const equippedIds = new Set(equippedWeapons.map((w) => w.id));
-  if (equippedWeapons.length < MAX_WEAPON_SLOTS) {
+  const equippedIds = new Set(playerObj.weapons.map((w) => w.id));
+  if (playerObj.weapons.length < MAX_WEAPON_SLOTS) {
     for (const [id, def] of Object.entries(WEAPON_DEFS)) {
       if (!equippedIds.has(id)) {
         options.push({
@@ -114,7 +96,7 @@ function _generateChoices() {
   }
 
   // Weapon level ups
-  for (const w of equippedWeapons) {
+  for (const w of playerObj.weapons) {
     const def = WEAPON_DEFS[w.id];
     if (w.level < def.maxLevel) {
       options.push({
@@ -141,18 +123,27 @@ function _generateChoices() {
   return options.slice(0, 3);
 }
 
-function _renderChoices(choices, player) {
+/**
+ * Show the upgrade menu UI with given choices.
+ * @param {Array} choices - Array of choice objects
+ * @param {string} playerLabel - Label like "Player 1" or "Player 2"
+ * @param {Function} onPick - Callback(choiceIndex) when user picks
+ */
+export function showUpgradeMenuUI(choices, playerLabel, onPick) {
+  _isOpen = true;
+  gameState.paused = true;
+
   overlay.innerHTML = `
-    <h2 style="color: #ffcc00; font-size: 36px; margin-bottom: 24px; text-shadow: 0 0 10px #ffcc00;">
+    <h2 style="color: #ffcc00; font-size: 36px; margin-bottom: 8px; text-shadow: 0 0 10px #ffcc00;">
       LEVEL UP!
     </h2>
-    <div style="color: #ccc; font-size: 16px; margin-bottom: 20px;">Choose an upgrade:</div>
+    <div style="color: #aaa; font-size: 16px; margin-bottom: 20px;">${playerLabel} — Choose an upgrade:</div>
     <div id="upgrade-cards" style="display: flex; gap: 16px; flex-wrap: wrap; justify-content: center;"></div>
   `;
 
   const cardsContainer = overlay.querySelector("#upgrade-cards");
 
-  for (const choice of choices) {
+  choices.forEach((choice, index) => {
     const card = document.createElement("div");
     card.style.cssText = `
       width: 220px; padding: 24px 18px;
@@ -187,26 +178,40 @@ function _renderChoices(choices, player) {
     });
 
     card.addEventListener("click", () => {
-      _applyChoice(choice, player);
-      _hideMenu();
+      onPick(index);
     });
 
     cardsContainer.appendChild(card);
-  }
+  });
+
+  overlay.style.display = "flex";
 }
 
-function _applyChoice(choice, player) {
+/**
+ * Apply an upgrade choice to a player.
+ */
+export function applyUpgradeChoice(choice, playerObj) {
   switch (choice.type) {
     case "newWeapon":
-      addWeapon(choice.id);
+      addWeapon(playerObj, choice.id);
       break;
     case "levelWeapon":
-      levelUpWeapon(choice.id);
+      levelUpWeapon(playerObj, choice.id);
       break;
     case "passive": {
       const passive = PASSIVE_UPGRADES.find((p) => p.id === choice.id);
-      if (passive) passive.apply(player);
+      if (passive) passive.apply(playerObj);
       break;
     }
   }
+}
+
+/**
+ * Hide the upgrade menu and unpause.
+ */
+export function hideUpgradeMenu() {
+  _isOpen = false;
+  gameState.paused = false;
+  overlay.style.display = "none";
+  overlay.innerHTML = "";
 }

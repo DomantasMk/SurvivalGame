@@ -1,8 +1,7 @@
-// player.js — Player entity (mesh, physics body, HP, speed, invincibility frames)
+// player.js — Player entity factory (supports multiple player instances)
 
 import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
-import { getMovementVector } from "./input.js";
 import { clamp } from "./utils.js";
 import { screenShake } from "./camera.js";
 import {
@@ -16,77 +15,101 @@ const PLAYER_SIZE = 0.5;
 const BASE_SPEED = 7;
 const INVINCIBILITY_DURATION = 0.8; // seconds
 
-export const player = {
-  mesh: null,
-  body: null,
-  collider: null,
+// Per-player animation time tracking
+const _animTimes = new WeakMap();
 
-  // Stats
-  hp: 150,
-  maxHp: 150,
-  speed: BASE_SPEED,
-  level: 1,
-  xp: 0,
-  armor: 0,
-  pickupRadius: 3.5,
+/**
+ * Create a new player object with mesh, physics body, and stats.
+ * @param {THREE.Scene} scene
+ * @param {RAPIER.World} world
+ * @param {{ spawnX?: number, spawnZ?: number, colorTheme?: string }} config
+ */
+export function createPlayer(scene, world, config = {}) {
+  const { spawnX = 0, spawnZ = 0, colorTheme = "blue" } = config;
 
-  // State
-  invincibilityTimer: 0,
-  alive: true,
-  kills: 0,
-
-  // Facing direction (for whip etc.)
-  facingAngle: 0,
-
-  // Animation references
-  anim: null,
-};
-
-// Accumulated time for animation
-let _animTime = 0;
-
-export function createPlayer(scene, world) {
-  // --- Mesh (detailed character model) ---
-  const { group, anim } = createPlayerModel();
-  player.mesh = group;
-  player.anim = anim;
-  group.position.set(0, PLAYER_SIZE * 0.9, 0);
+  // --- Mesh (detailed character model with color theme) ---
+  const { group, anim } = createPlayerModel(colorTheme);
+  group.position.set(spawnX, PLAYER_SIZE * 0.9, spawnZ);
   scene.add(group);
 
   // --- Rapier kinematic rigid body ---
   const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
-    0,
+    spawnX,
     PLAYER_SIZE * 0.9,
-    0,
+    spawnZ,
   );
-  player.body = world.createRigidBody(bodyDesc);
+  const body = world.createRigidBody(bodyDesc);
 
   const colliderDesc = RAPIER.ColliderDesc.cuboid(
     PLAYER_SIZE / 2,
     PLAYER_SIZE * 0.9,
     PLAYER_SIZE / 2,
   );
-  player.collider = world.createCollider(colliderDesc, player.body);
+  const collider = world.createCollider(colliderDesc, body);
 
-  return player;
+  const playerObj = {
+    mesh: group,
+    body,
+    collider,
+
+    // Stats
+    hp: 150,
+    maxHp: 150,
+    speed: BASE_SPEED,
+    level: 1,
+    xp: 0,
+    armor: 0,
+    pickupRadius: 3.5,
+
+    // State
+    invincibilityTimer: 0,
+    alive: true,
+    kills: 0,
+
+    // Facing direction (for whip etc.)
+    facingAngle: 0,
+
+    // Animation references
+    anim,
+
+    // Per-player weapon list (managed by weaponManager)
+    weapons: [],
+
+    // Config for reset
+    colorTheme,
+    spawnX,
+    spawnZ,
+  };
+
+  _animTimes.set(playerObj, 0);
+
+  return playerObj;
 }
 
 const _moveVec = new THREE.Vector3();
 
-export function updatePlayer(delta, arenaHalf) {
-  if (!player.alive) return;
+/**
+ * Update a player's position, animation, and invincibility.
+ * @param {object} playerObj - The player object
+ * @param {number} delta - Frame delta time
+ * @param {number} arenaHalf - Half the arena size for clamping
+ * @param {{ x: number, z: number }} inputVec - Movement input vector
+ */
+export function updatePlayer(playerObj, delta, arenaHalf, inputVec) {
+  if (!playerObj.alive) return;
 
-  _animTime += delta;
+  let animTime = _animTimes.get(playerObj) || 0;
+  animTime += delta;
+  _animTimes.set(playerObj, animTime);
 
   // --- Movement ---
-  const input = getMovementVector();
   _moveVec.set(
-    input.x * player.speed * delta,
+    inputVec.x * playerObj.speed * delta,
     0,
-    input.z * player.speed * delta,
+    inputVec.z * playerObj.speed * delta,
   );
 
-  const pos = player.mesh.position;
+  const pos = playerObj.mesh.position;
   pos.x += _moveVec.x;
   pos.z += _moveVec.z;
 
@@ -95,77 +118,83 @@ export function updatePlayer(delta, arenaHalf) {
   pos.z = clamp(pos.z, -arenaHalf, arenaHalf);
 
   // Sync physics body
-  player.body.setNextKinematicTranslation({
+  playerObj.body.setNextKinematicTranslation({
     x: pos.x,
     y: PLAYER_SIZE * 0.9,
     z: pos.z,
   });
 
   // --- Facing direction ---
-  const isMoving = Math.abs(input.x) > 0.01 || Math.abs(input.z) > 0.01;
+  const isMoving = Math.abs(inputVec.x) > 0.01 || Math.abs(inputVec.z) > 0.01;
   if (isMoving) {
-    player.facingAngle = Math.atan2(input.x, input.z);
-    player.mesh.rotation.y = player.facingAngle;
+    playerObj.facingAngle = Math.atan2(inputVec.x, inputVec.z);
+    playerObj.mesh.rotation.y = playerObj.facingAngle;
   }
 
   // --- Walking animation ---
-  animatePlayerModel(player.anim, isMoving, _animTime);
+  animatePlayerModel(playerObj.anim, isMoving, animTime);
 
   // --- Invincibility timer ---
-  if (player.invincibilityTimer > 0) {
-    player.invincibilityTimer -= delta;
+  if (playerObj.invincibilityTimer > 0) {
+    playerObj.invincibilityTimer -= delta;
     // Flash effect: toggle visibility
-    player.mesh.visible = Math.floor(player.invincibilityTimer * 10) % 2 === 0;
+    playerObj.mesh.visible =
+      Math.floor(playerObj.invincibilityTimer * 10) % 2 === 0;
   } else {
-    player.mesh.visible = true;
+    playerObj.mesh.visible = true;
   }
 }
 
 /**
- * Deal damage to the player. Respects invincibility and armor.
+ * Deal damage to a player. Respects invincibility and armor.
  */
-export function damagePlayer(amount) {
-  if (!player.alive) return;
-  if (player.invincibilityTimer > 0) return;
+export function damagePlayer(playerObj, amount) {
+  if (!playerObj.alive) return;
+  if (playerObj.invincibilityTimer > 0) return;
 
-  const effectiveDamage = Math.max(1, amount - player.armor);
-  player.hp -= effectiveDamage;
-  player.invincibilityTimer = INVINCIBILITY_DURATION;
+  const effectiveDamage = Math.max(1, amount - playerObj.armor);
+  playerObj.hp -= effectiveDamage;
+  playerObj.invincibilityTimer = INVINCIBILITY_DURATION;
   screenShake(0.4, 0.15);
 
-  if (player.hp <= 0) {
-    player.hp = 0;
-    player.alive = false;
+  if (playerObj.hp <= 0) {
+    playerObj.hp = 0;
+    playerObj.alive = false;
   }
 }
 
 /**
- * Reset player to initial state (for restart).
+ * Reset a player to initial state (for restart).
  */
-export function resetPlayer() {
-  player.hp = 150;
-  player.maxHp = 150;
-  player.speed = BASE_SPEED;
-  player.level = 1;
-  player.xp = 0;
-  player.armor = 0;
-  player.pickupRadius = 3.5;
-  player.invincibilityTimer = 0;
-  player.alive = true;
-  player.kills = 0;
-  player.facingAngle = 0;
-  _animTime = 0;
-  if (player.mesh) {
-    player.mesh.position.set(0, PLAYER_SIZE * 0.9, 0);
-    player.mesh.rotation.set(0, 0, 0);
-    player.mesh.visible = true;
-    resetAnimParts(player.anim);
+export function resetPlayer(playerObj) {
+  playerObj.hp = 150;
+  playerObj.maxHp = 150;
+  playerObj.speed = BASE_SPEED;
+  playerObj.level = 1;
+  playerObj.xp = 0;
+  playerObj.armor = 0;
+  playerObj.pickupRadius = 3.5;
+  playerObj.invincibilityTimer = 0;
+  playerObj.alive = true;
+  playerObj.kills = 0;
+  playerObj.facingAngle = 0;
+  playerObj.weapons = [];
+  _animTimes.set(playerObj, 0);
+  if (playerObj.mesh) {
+    playerObj.mesh.position.set(
+      playerObj.spawnX || 0,
+      PLAYER_SIZE * 0.9,
+      playerObj.spawnZ || 0,
+    );
+    playerObj.mesh.rotation.set(0, 0, 0);
+    playerObj.mesh.visible = true;
+    resetAnimParts(playerObj.anim);
   }
-  if (player.body) {
-    player.body.setNextKinematicTranslation({
-      x: 0,
+  if (playerObj.body) {
+    playerObj.body.setNextKinematicTranslation({
+      x: playerObj.spawnX || 0,
       y: PLAYER_SIZE * 0.9,
-      z: 0,
+      z: playerObj.spawnZ || 0,
     });
   }
 }

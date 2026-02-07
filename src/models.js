@@ -139,15 +139,24 @@ export function resetAnimParts(anim) {
 
 // ── Player Model (Vampire Hunter) ──────────────────────────────
 
-export function createPlayerModel() {
+export function createPlayerModel(colorTheme = "blue") {
   const group = new THREE.Group();
 
   const SKIN = 0xffcc99;
-  const OUTFIT = 0x4488ff;
-  const DARK = 0x2255cc;
-  const BELT_COL = 0x885533;
-  const SCARF = 0xcc3333;
   const EYES = 0x222244;
+  const BELT_COL = 0x885533;
+
+  // Color theme for Player 1 (blue) vs Player 2 (red)
+  let OUTFIT, DARK, SCARF;
+  if (colorTheme === "red") {
+    OUTFIT = 0xff4444;
+    DARK = 0xcc2222;
+    SCARF = 0x4488ff;
+  } else {
+    OUTFIT = 0x4488ff;
+    DARK = 0x2255cc;
+    SCARF = 0xcc3333;
+  }
 
   // Head
   _sphere(group, 0.11, SKIN, 0, 0.28, 0);

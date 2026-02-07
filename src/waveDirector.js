@@ -1,4 +1,4 @@
-// waveDirector.js — Wave timing, difficulty scaling over time
+// waveDirector.js — Wave timing, difficulty scaling over time (multiplayer)
 
 import { spawnEnemy, ENEMY_TYPES } from "./enemyManager.js";
 import { randomRange } from "./utils.js";
@@ -12,6 +12,7 @@ const BASE_SPAWN_INTERVAL = 2.0; // seconds between spawn waves
 const MIN_SPAWN_INTERVAL = 0.5;
 const BASE_ENEMIES_PER_WAVE = 2;
 const BOSS_INTERVAL = 360; // 6 minutes
+const MULTIPLAYER_SCALE = 1.3; // 30% more enemies for 2 players
 
 const SPAWN_DISTANCE_MIN = 18;
 const SPAWN_DISTANCE_MAX = 25;
@@ -21,7 +22,12 @@ export function createWaveDirector() {
   bossTimer = 0;
 }
 
-export function updateWaveDirector(delta, player) {
+/**
+ * Update spawning logic.
+ * @param {number} delta
+ * @param {Array} players - Array of alive player objects (for spawn positioning)
+ */
+export function updateWaveDirector(delta, players) {
   const time = gameState.gameTime;
 
   // --- Compute current difficulty ---
@@ -30,27 +36,33 @@ export function updateWaveDirector(delta, player) {
     BASE_SPAWN_INTERVAL -
     (BASE_SPAWN_INTERVAL - MIN_SPAWN_INTERVAL) * difficultyFactor;
   const enemiesPerWave = Math.floor(
-    BASE_ENEMIES_PER_WAVE + difficultyFactor * 7,
+    (BASE_ENEMIES_PER_WAVE + difficultyFactor * 7) * MULTIPLAYER_SCALE,
   );
 
   // --- Spawn timer ---
   spawnTimer -= delta;
   if (spawnTimer <= 0) {
     spawnTimer = spawnInterval;
-    _spawnWave(player, enemiesPerWave, time);
+    _spawnWave(players, enemiesPerWave, time);
   }
 
   // --- Boss timer ---
   bossTimer += delta;
   if (bossTimer >= BOSS_INTERVAL) {
     bossTimer -= BOSS_INTERVAL;
-    _spawnBoss(player);
+    _spawnBoss(players);
   }
 }
 
-function _spawnWave(player, count, time) {
-  const px = player.mesh.position.x;
-  const pz = player.mesh.position.z;
+function _spawnWave(players, count, time) {
+  // Spawn around a random alive player (or center if none)
+  const alivePlayers = players.filter((p) => p.alive);
+  const target =
+    alivePlayers.length > 0
+      ? alivePlayers[Math.floor(Math.random() * alivePlayers.length)]
+      : null;
+  const px = target ? target.mesh.position.x : 0;
+  const pz = target ? target.mesh.position.z : 0;
 
   for (let i = 0; i < count; i++) {
     const angle = randomRange(0, Math.PI * 2);
@@ -76,9 +88,14 @@ function _spawnWave(player, count, time) {
   }
 }
 
-function _spawnBoss(player) {
-  const px = player.mesh.position.x;
-  const pz = player.mesh.position.z;
+function _spawnBoss(players) {
+  const alivePlayers = players.filter((p) => p.alive);
+  const target =
+    alivePlayers.length > 0
+      ? alivePlayers[Math.floor(Math.random() * alivePlayers.length)]
+      : null;
+  const px = target ? target.mesh.position.x : 0;
+  const pz = target ? target.mesh.position.z : 0;
   const angle = randomRange(0, Math.PI * 2);
   const dist = SPAWN_DISTANCE_MAX;
   spawnEnemy("boss", px + Math.cos(angle) * dist, pz + Math.sin(angle) * dist);

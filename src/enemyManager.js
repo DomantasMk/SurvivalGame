@@ -1,8 +1,8 @@
-// enemyManager.js — Enemy spawning, pooling, AI (move toward player)
+// enemyManager.js — Enemy spawning, pooling, AI (move toward nearest player)
 
 import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
-import { damagePlayer, player } from "./player.js";
+import { damagePlayer } from "./player.js";
 import { spawnXpGem } from "./xpManager.js";
 import { gameState } from "./main.js";
 import { spawnDeathParticles } from "./particles.js";
@@ -21,6 +21,9 @@ export const enemies = [];
 
 // Type-specific object pools for reuse
 const pools = {};
+
+// Sequential ID counter for multiplayer state sync
+let _nextEnemyId = 0;
 
 // Enemy type definitions
 export const ENEMY_TYPES = {
@@ -118,6 +121,7 @@ function _createEnemy(def, typeKey, x, z) {
   const collider = world.createCollider(colliderDesc, body);
 
   return {
+    id: _nextEnemyId++,
     mesh: group,
     body,
     collider,
@@ -139,6 +143,7 @@ function _createEnemy(def, typeKey, x, z) {
 }
 
 function _resetEnemy(enemy, def, x, z) {
+  enemy.id = _nextEnemyId++;
   enemy.hp = def.hp;
   enemy.maxHp = def.hp;
   enemy.speed = def.speed;
@@ -169,8 +174,16 @@ function _resetEnemy(enemy, def, x, z) {
 
 const _dir = new THREE.Vector3();
 
-export function updateEnemies(delta, player) {
+/**
+ * Update all enemies: AI targeting, movement, contact damage.
+ * @param {number} delta
+ * @param {Array} players - Array of player objects (alive or dead)
+ */
+export function updateEnemies(delta, players) {
   _enemyTime += delta;
+
+  // Filter to alive players for targeting
+  const alivePlayers = players.filter((p) => p.alive);
 
   for (let i = enemies.length - 1; i >= 0; i--) {
     const e = enemies[i];
@@ -180,8 +193,24 @@ export function updateEnemies(delta, player) {
       continue;
     }
 
-    // --- AI: move toward player ---
-    const pp = player.mesh.position;
+    // --- Find nearest alive player ---
+    let nearestPlayer = null;
+    let nearestDist = Infinity;
+    for (const p of alivePlayers) {
+      const ep = e.body.translation();
+      const dx = p.mesh.position.x - ep.x;
+      const dz = p.mesh.position.z - ep.z;
+      const d = Math.sqrt(dx * dx + dz * dz);
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearestPlayer = p;
+      }
+    }
+
+    if (!nearestPlayer) continue; // No alive players
+
+    // --- AI: move toward nearest player ---
+    const pp = nearestPlayer.mesh.position;
     const ep = e.body.translation();
 
     _dir.set(pp.x - ep.x, 0, pp.z - ep.z);
@@ -196,7 +225,7 @@ export function updateEnemies(delta, player) {
     const t = e.body.translation();
     e.mesh.position.set(t.x, t.y, t.z);
 
-    // Face toward the player
+    // Face toward the nearest player
     if (dist > 0.5) {
       e.mesh.rotation.y = Math.atan2(pp.x - t.x, pp.z - t.z);
     }
@@ -210,20 +239,25 @@ export function updateEnemies(delta, player) {
     // --- Animate model ---
     animateEnemyModel(e.type, e.anim, _enemyTime + e.animTimeOffset);
 
-    // --- Contact damage to player ---
+    // --- Contact damage to any nearby player ---
     e.damageCooldown -= delta;
-    if (dist < e.size / 2 + 0.5 && e.damageCooldown <= 0) {
-      damagePlayer(e.damage);
-      e.damageCooldown = DAMAGE_COOLDOWN;
+    if (e.damageCooldown <= 0) {
+      for (const p of alivePlayers) {
+        const dx = p.mesh.position.x - e.mesh.position.x;
+        const dz = p.mesh.position.z - e.mesh.position.z;
+        const pd = Math.sqrt(dx * dx + dz * dz);
+        if (pd < e.size / 2 + 0.5) {
+          damagePlayer(p, e.damage);
+          e.damageCooldown = DAMAGE_COOLDOWN;
 
-      // Knockback player slightly
-      if (player.body) {
-        const kb = _dir
-          .clone()
-          .normalize()
-          .multiplyScalar(-KNOCKBACK_FORCE * 0.3);
-        player.mesh.position.x += kb.x;
-        player.mesh.position.z += kb.z;
+          // Knockback the hit player slightly
+          const len = pd > 0.01 ? pd : 1;
+          const kbx = (dx / len) * KNOCKBACK_FORCE * 0.3;
+          const kbz = (dz / len) * KNOCKBACK_FORCE * 0.3;
+          p.mesh.position.x += kbx;
+          p.mesh.position.z += kbz;
+          break; // Only damage one player per cooldown cycle
+        }
       }
     }
 
@@ -247,8 +281,8 @@ function _killEnemy(index) {
   // Drop XP gem
   spawnXpGem(pos.x, pos.z, e.xpValue);
 
-  // Increment kill counter
-  player.kills++;
+  // Increment shared kill counter
+  gameState.totalKills++;
 
   // Return to type-specific pool
   e.mesh.visible = false;

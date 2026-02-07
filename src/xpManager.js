@@ -1,8 +1,7 @@
-// xpManager.js — XP gems, collection radius, level thresholds
+// xpManager.js — XP gems, collection radius, level thresholds (multi-player)
 
 import * as THREE from "three";
 import { distXZ } from "./utils.js";
-import { showUpgradeMenu } from "./upgradeMenu.js";
 import { gameState } from "./main.js";
 
 let scene;
@@ -10,6 +9,9 @@ let scene;
 // Active XP gems
 const gems = [];
 const pool = [];
+
+// Callback for level-up events (set by main.js)
+let _levelUpCallback = null;
 
 // XP thresholds per level (exponential curve)
 function xpForLevel(level) {
@@ -29,6 +31,14 @@ const GEM_Y = 0.3;
 
 export function createXpManager(s) {
   scene = s;
+}
+
+/**
+ * Set the callback for when a player levels up.
+ * Called with (playerObj) as argument.
+ */
+export function setLevelUpCallback(cb) {
+  _levelUpCallback = cb;
 }
 
 /**
@@ -69,6 +79,7 @@ function _createGem(x, z, value, tier) {
     mesh,
     value,
     attracting: false,
+    attractTarget: null, // which player is attracting this gem
     bobPhase: Math.random() * Math.PI * 2,
   };
 }
@@ -76,6 +87,7 @@ function _createGem(x, z, value, tier) {
 function _resetGem(gem, x, z, value, tier) {
   gem.value = value;
   gem.attracting = false;
+  gem.attractTarget = null;
   gem.bobPhase = Math.random() * Math.PI * 2;
   gem.mesh.position.set(x, GEM_Y, z);
   gem.mesh.material.color.setHex(tier.color);
@@ -85,10 +97,13 @@ function _resetGem(gem, x, z, value, tier) {
 
 const _dir = new THREE.Vector3();
 
-export function updateXpGems(delta, player) {
-  const px = player.mesh.position.x;
-  const pz = player.mesh.position.z;
-  const pickupR = player.pickupRadius;
+/**
+ * Update XP gems: bob animation, attract to nearest player, collect.
+ * @param {number} delta
+ * @param {Array} players - Array of alive player objects
+ */
+export function updateXpGems(delta, players) {
+  const alivePlayers = players.filter((p) => p.alive);
 
   for (let i = gems.length - 1; i >= 0; i--) {
     const gem = gems[i];
@@ -98,15 +113,29 @@ export function updateXpGems(delta, player) {
     gem.mesh.position.y = GEM_Y + Math.sin(gem.bobPhase) * 0.1;
     gem.mesh.rotation.y += delta * 2;
 
-    const d = distXZ(gem.mesh.position, player.mesh.position);
-
-    // Start attracting when within pickup radius
-    if (d < pickupR) {
-      gem.attracting = true;
+    // Find nearest alive player within pickup radius
+    let nearestPlayer = null;
+    let nearestDist = Infinity;
+    for (const p of alivePlayers) {
+      const d = distXZ(gem.mesh.position, p.mesh.position);
+      if (d < p.pickupRadius && d < nearestDist) {
+        nearestDist = d;
+        nearestPlayer = p;
+      }
     }
 
-    if (gem.attracting) {
-      // Fly toward player
+    // Start attracting toward nearest player in range
+    if (nearestPlayer) {
+      gem.attracting = true;
+      gem.attractTarget = nearestPlayer;
+    }
+
+    if (gem.attracting && gem.attractTarget) {
+      const target = gem.attractTarget;
+      const px = target.mesh.position.x;
+      const pz = target.mesh.position.z;
+
+      // Fly toward target player
       _dir.set(px - gem.mesh.position.x, 0, pz - gem.mesh.position.z);
       const len = _dir.length();
       if (len > 0.01) {
@@ -117,26 +146,26 @@ export function updateXpGems(delta, player) {
 
       // Collect when very close
       if (len < 0.5) {
-        _collectGem(i, player);
+        _collectGem(i, target);
         continue;
       }
     }
   }
 }
 
-function _collectGem(index, player) {
+function _collectGem(index, playerObj) {
   const gem = gems[index];
 
-  // Add XP
-  player.xp += gem.value;
+  // Add XP to the collecting player
+  playerObj.xp += gem.value;
 
   // Check level up
-  const needed = xpForLevel(player.level);
-  if (player.xp >= needed) {
-    player.xp -= needed;
-    player.level++;
-    // Show upgrade menu
-    showUpgradeMenu(player);
+  const needed = xpForLevel(playerObj.level);
+  if (playerObj.xp >= needed) {
+    playerObj.xp -= needed;
+    playerObj.level++;
+    // Notify via callback (main.js handles showing upgrade menu or network)
+    if (_levelUpCallback) _levelUpCallback(playerObj);
   }
 
   // Return to pool
@@ -147,6 +176,13 @@ function _collectGem(index, player) {
 
 export function getXpForNextLevel(level) {
   return xpForLevel(level);
+}
+
+/**
+ * Get the active gems array (for state serialization).
+ */
+export function getActiveGems() {
+  return gems;
 }
 
 export function resetXpGems() {
