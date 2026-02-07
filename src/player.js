@@ -160,6 +160,9 @@ export function damagePlayer(playerObj, amount) {
   if (playerObj.hp <= 0) {
     playerObj.hp = 0;
     playerObj.alive = false;
+    // Rotate to lie on the ground
+    playerObj.mesh.rotation.x = -Math.PI / 2;
+    playerObj.mesh.position.y = 0.15;
   }
 }
 

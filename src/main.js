@@ -22,6 +22,7 @@ import {
   resetWeapons,
   resetAllWeaponVisuals,
   addWeapon,
+  getActiveVisualStates,
 } from "./weaponManager.js";
 import {
   updateProjectiles,
@@ -46,7 +47,7 @@ import {
   isUpgradeMenuOpen,
 } from "./upgradeMenu.js";
 import { updateParticles } from "./particles.js";
-import { getMovementVector } from "./input.js";
+import { getMovementVector, consumeKeyPress } from "./input.js";
 import {
   connect,
   send,
@@ -104,6 +105,10 @@ const _pendingUpgradeChoices = {}; // keyed by playerIndex
 // Lobby state
 let _lobbyPlayerIndices = [];
 
+// Spectator mode (when local player is dead, camera follows other alive players)
+let _spectatingIndex = -1;
+let _spectatorHudEl = null;
+
 // Guest-side: latest state from the host
 let _currentHostState = null;
 let _previousHostState = null;
@@ -114,6 +119,7 @@ const INTERPOLATION_DELAY = 0.01;
 const _guestEnemyMap = new Map();
 const _guestProjectiles = [];
 const _guestGems = [];
+const _guestWeaponVisualMap = new Map();
 
 // ---------- Initialization ----------
 
@@ -318,7 +324,8 @@ async function init() {
 
   // --- Shadow light + player light follows local player ---
   function updateLights() {
-    const localPlayer = players[_myPlayerArrayIndex];
+    const targetIdx = _getCameraTargetIndex();
+    const localPlayer = players[targetIdx];
     if (!localPlayer || !localPlayer.mesh) return;
     directionalLight.position.set(
       localPlayer.mesh.position.x + 5,
@@ -350,13 +357,111 @@ async function init() {
   }
 }
 
+// ---------- Spectator Mode ----------
+
+function _getAlivePlayers() {
+  const alive = [];
+  for (let i = 0; i < players.length; i++) {
+    if (players[i].alive) alive.push(i);
+  }
+  return alive;
+}
+
+/** Returns which player index the camera should follow. */
+function _getCameraTargetIndex() {
+  const localPlayer = players[_myPlayerArrayIndex];
+  if (localPlayer && localPlayer.alive) {
+    _spectatingIndex = -1;
+    return _myPlayerArrayIndex;
+  }
+
+  const alive = _getAlivePlayers();
+  if (alive.length === 0) return _myPlayerArrayIndex;
+
+  // If not yet spectating or current target died, pick first alive
+  if (
+    _spectatingIndex < 0 ||
+    !players[_spectatingIndex] ||
+    !players[_spectatingIndex].alive
+  ) {
+    _spectatingIndex = alive[0];
+  }
+
+  return _spectatingIndex;
+}
+
+/** Handle A/D key presses to cycle spectator target when dead. */
+function _handleSpectatorInput() {
+  // Always consume A/D presses to prevent stale state buildup
+  const pressedA = consumeKeyPress("KeyA") || consumeKeyPress("ArrowLeft");
+  const pressedD = consumeKeyPress("KeyD") || consumeKeyPress("ArrowRight");
+
+  const localPlayer = players[_myPlayerArrayIndex];
+  if (!localPlayer || localPlayer.alive) {
+    if (_spectatorHudEl) _spectatorHudEl.style.display = "none";
+    return;
+  }
+
+  const alive = _getAlivePlayers();
+  if (alive.length === 0) {
+    _updateSpectatorHud();
+    return;
+  }
+
+  // Ensure we have a valid spectating target
+  _getCameraTargetIndex();
+
+  if (pressedA) {
+    const currentIdx = alive.indexOf(_spectatingIndex);
+    const newIdx = currentIdx <= 0 ? alive.length - 1 : currentIdx - 1;
+    _spectatingIndex = alive[newIdx];
+  }
+  if (pressedD) {
+    const currentIdx = alive.indexOf(_spectatingIndex);
+    const newIdx = currentIdx >= alive.length - 1 ? 0 : currentIdx + 1;
+    _spectatingIndex = alive[newIdx];
+  }
+
+  _updateSpectatorHud();
+}
+
+function _createSpectatorHud() {
+  _spectatorHudEl = document.createElement("div");
+  _spectatorHudEl.style.cssText = `
+    position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.7); color: #fff; padding: 10px 24px;
+    border-radius: 8px; font-family: 'Segoe UI', sans-serif;
+    font-size: 16px; z-index: 500; display: none;
+    border: 1px solid rgba(255,255,255,0.2);
+    text-align: center; pointer-events: none;
+  `;
+  document.body.appendChild(_spectatorHudEl);
+}
+
+function _updateSpectatorHud() {
+  if (!_spectatorHudEl) _createSpectatorHud();
+
+  if (_spectatingIndex < 0 || _spectatingIndex >= players.length) {
+    _spectatorHudEl.style.display = "none";
+    return;
+  }
+
+  const color = PLAYER_HEX_COLORS[_spectatingIndex % PLAYER_HEX_COLORS.length];
+  _spectatorHudEl.innerHTML = `
+    <span style="color: #aaa;">Spectating</span>
+    <span style="color: ${color}; font-weight: bold;">Player ${_spectatingIndex + 1}</span>
+    <br><span style="color: #666; font-size: 13px;">A / D to switch</span>
+  `;
+  _spectatorHudEl.style.display = "block";
+}
+
 // ---------- Host Game Loop ----------
 
 function _animateHost(clock, scene, camera, renderer, world, updateLights) {
   let _lastTime = performance.now();
 
   function loop() {
-    setTimeout(loop, 8);
+    setTimeout(loop, 16);
 
     const now = performance.now();
     const rawDelta = (now - _lastTime) / 1000;
@@ -382,9 +487,11 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
       updatePlayer(players[i], delta, ARENA_HALF, input);
     }
 
-    // --- Camera follows host's player ---
+    // --- Camera follows host's player (or spectated player if dead) ---
+    _handleSpectatorInput();
     if (!document.hidden) {
-      updateCamera(camera, players[_myPlayerArrayIndex].mesh, delta);
+      const cameraTargetIdx = _getCameraTargetIndex();
+      updateCamera(camera, players[cameraTargetIdx].mesh, delta);
       updateLights();
     }
 
@@ -400,7 +507,8 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
     updateParticles(delta);
 
     if (!document.hidden) {
-      updateHud(players[_myPlayerArrayIndex], players, gameState);
+      const hudTargetIdx = _getCameraTargetIndex();
+      updateHud(players[hudTargetIdx], players, gameState);
     }
 
     // Step the physics world
@@ -464,15 +572,17 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
     _animateGuestEnemies(_guestLocalTime);
     _animateGuestGems(delta);
 
-    // --- Camera follows local player ---
-    const localPlayer = players[_myPlayerArrayIndex];
-    if (localPlayer) {
-      updateCamera(camera, localPlayer.mesh, delta);
+    // --- Camera follows local player (or spectated player if dead) ---
+    _handleSpectatorInput();
+    const cameraTargetIdx = _getCameraTargetIndex();
+    if (cameraTargetIdx >= 0 && players[cameraTargetIdx]) {
+      updateCamera(camera, players[cameraTargetIdx].mesh, delta);
     }
     updateLights();
 
     // --- Update HUD ---
-    updateHud(players[_myPlayerArrayIndex], players, gameState);
+    const guestHudTargetIdx = _getCameraTargetIndex();
+    updateHud(players[guestHudTargetIdx], players, gameState);
 
     renderer.render(scene, camera);
   }
@@ -512,6 +622,7 @@ function _sendGameState() {
       y: g.mesh.position.y,
       z: g.mesh.position.z,
     })),
+    wv: getActiveVisualStates(players),
   };
   send(state);
 }
@@ -557,6 +668,11 @@ function _applyHostState(state, scene, interpolationFactor) {
   // Sync gem meshes
   _syncGuestGems(state.gm, scene, interpolationFactor);
 
+  // Sync weapon visuals (whip arcs, garlic auras, holy water pools)
+  if (state.wv) {
+    _syncGuestWeaponVisuals(state.wv, scene);
+  }
+
   // Check game over
   if (state.go && !gameState.gameOver) {
     gameState.gameOver = true;
@@ -584,7 +700,6 @@ function _interpolateHostState(prevState, currState, scene, t) {
 function _applyPlayerState(playerObj, s, interpolationFactor) {
   playerObj.mesh.position.x = s.x;
   playerObj.mesh.position.z = s.z;
-  playerObj.mesh.position.y = PLAYER_SIZE * 0.9;
   playerObj.mesh.rotation.y = s.fa;
   playerObj.facingAngle = s.fa;
   playerObj.hp = s.hp;
@@ -594,11 +709,18 @@ function _applyPlayerState(playerObj, s, interpolationFactor) {
   playerObj.alive = s.al;
 
   if (!s.al) {
+    // Dead: rotate to lie on the ground
+    playerObj.mesh.rotation.x = -Math.PI / 2;
+    playerObj.mesh.position.y = 0.15;
     playerObj.mesh.visible = true;
-  } else if (s.inv) {
-    playerObj.mesh.visible = Math.floor(performance.now() / 100) % 2 === 0;
   } else {
-    playerObj.mesh.visible = true;
+    playerObj.mesh.rotation.x = 0;
+    playerObj.mesh.position.y = PLAYER_SIZE * 0.9;
+    if (s.inv) {
+      playerObj.mesh.visible = Math.floor(performance.now() / 100) % 2 === 0;
+    } else {
+      playerObj.mesh.visible = true;
+    }
   }
 }
 
@@ -611,7 +733,6 @@ function _interpolatePlayerState(playerObj, prevS, currS, t) {
   if (rotDiff < -Math.PI) rotDiff += Math.PI * 2;
   playerObj.mesh.rotation.y = prevS.fa + rotDiff * t;
 
-  playerObj.mesh.position.y = PLAYER_SIZE * 0.9;
   playerObj.facingAngle = currS.fa;
   playerObj.hp = currS.hp;
   playerObj.maxHp = currS.mhp;
@@ -620,11 +741,18 @@ function _interpolatePlayerState(playerObj, prevS, currS, t) {
   playerObj.alive = currS.al;
 
   if (!currS.al) {
+    // Dead: rotate to lie on the ground
+    playerObj.mesh.rotation.x = -Math.PI / 2;
+    playerObj.mesh.position.y = 0.15;
     playerObj.mesh.visible = true;
-  } else if (currS.inv) {
-    playerObj.mesh.visible = Math.floor(performance.now() / 100) % 2 === 0;
   } else {
-    playerObj.mesh.visible = true;
+    playerObj.mesh.rotation.x = 0;
+    playerObj.mesh.position.y = PLAYER_SIZE * 0.9;
+    if (currS.inv) {
+      playerObj.mesh.visible = Math.floor(performance.now() / 100) % 2 === 0;
+    } else {
+      playerObj.mesh.visible = true;
+    }
   }
 }
 
@@ -813,6 +941,99 @@ function _animateGuestGems(delta) {
   for (const gem of _guestGems) {
     if (gem.visible) {
       gem.rotation.y += delta * 2;
+    }
+  }
+}
+
+// ---------- Guest Weapon Visual Sync ----------
+
+function _syncGuestWeaponVisuals(visualStates, scene) {
+  const activeIds = new Set();
+
+  for (const vs of visualStates) {
+    activeIds.add(vs.id);
+
+    let entry = _guestWeaponVisualMap.get(vs.id);
+    if (!entry) {
+      // Create new visual mesh based on type
+      let mesh;
+      switch (vs.t) {
+        case "whip": {
+          const geo = new THREE.RingGeometry(
+            0.3,
+            vs.a,
+            16,
+            1,
+            -Math.PI * 0.5,
+            Math.PI,
+          );
+          const mat = new THREE.MeshBasicMaterial({
+            color: 0xffcc44,
+            transparent: true,
+            opacity: vs.op,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          mesh = new THREE.Mesh(geo, mat);
+          mesh.rotation.x = -Math.PI / 2;
+          break;
+        }
+        case "garlic": {
+          const geo = new THREE.RingGeometry(vs.a - 0.3, vs.a, 32);
+          const mat = new THREE.MeshBasicMaterial({
+            color: 0x88ff88,
+            transparent: true,
+            opacity: vs.op,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          mesh = new THREE.Mesh(geo, mat);
+          mesh.rotation.x = -Math.PI / 2;
+          break;
+        }
+        case "holyWater": {
+          const geo = new THREE.CircleGeometry(vs.a, 24);
+          const mat = new THREE.MeshBasicMaterial({
+            color: 0x4488ff,
+            transparent: true,
+            opacity: vs.op,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          mesh = new THREE.Mesh(geo, mat);
+          mesh.rotation.x = -Math.PI / 2;
+          break;
+        }
+      }
+      if (mesh) {
+        scene.add(mesh);
+        entry = { mesh, type: vs.t };
+        _guestWeaponVisualMap.set(vs.id, entry);
+      }
+    }
+
+    if (entry) {
+      // Update position, rotation, and opacity
+      entry.mesh.position.set(vs.x, vs.y, vs.z);
+      entry.mesh.rotation.z = vs.rz;
+      entry.mesh.material.opacity = vs.op;
+      entry.mesh.visible = true;
+
+      // Garlic follows its owner player on guest side
+      if (vs.t === "garlic" && vs.oi >= 0 && vs.oi < players.length) {
+        entry.mesh.position.x = players[vs.oi].mesh.position.x;
+        entry.mesh.position.z = players[vs.oi].mesh.position.z;
+      }
+    }
+  }
+
+  // Remove visuals no longer active
+  for (const [id, entry] of _guestWeaponVisualMap) {
+    if (!activeIds.has(id)) {
+      scene.remove(entry.mesh);
+      if (entry.mesh.geometry) entry.mesh.geometry.dispose();
+      if (entry.mesh.material) entry.mesh.material.dispose();
+      _guestWeaponVisualMap.delete(id);
     }
   }
 }

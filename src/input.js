@@ -1,8 +1,12 @@
 // input.js — Keyboard input state (WASD / Arrow keys)
 
 const keys = {};
+const _justPressed = new Set();
 
 window.addEventListener("keydown", (e) => {
+  if (!keys[e.code]) {
+    _justPressed.add(e.code);
+  }
   keys[e.code] = true;
 });
 
@@ -36,4 +40,16 @@ export function getMovementVector() {
 
 export function isKeyDown(code) {
   return !!keys[code];
+}
+
+/**
+ * Returns true once per key press (consumed on read).
+ * Use for discrete actions like cycling spectator targets.
+ */
+export function consumeKeyPress(code) {
+  if (_justPressed.has(code)) {
+    _justPressed.delete(code);
+    return true;
+  }
+  return false;
 }

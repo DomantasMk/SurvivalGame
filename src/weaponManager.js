@@ -22,6 +22,7 @@ const MAX_WEAPON_SLOTS = 6;
 
 // Temporary visuals for melee/area weapons (shared across all players)
 const _activeVisuals = [];
+let _visualIdCounter = 0;
 
 export function createWeaponManager() {
   // No module-level state needed anymore
@@ -226,7 +227,13 @@ function _fireWhip(weapon, stats, playerObj, enemiesList) {
   arcMesh.rotation.z = -angle;
   arcMesh.position.set(px, 0.5, pz);
   gameState.scene.add(arcMesh);
-  _activeVisuals.push({ mesh: arcMesh, timer: 0.2, type: "whip" });
+  _activeVisuals.push({
+    id: _visualIdCounter++,
+    mesh: arcMesh,
+    timer: 0.2,
+    type: "whip",
+    area,
+  });
 }
 
 // --- Garlic: AoE aura around player ---
@@ -258,9 +265,11 @@ function _fireGarlic(weapon, stats, playerObj, enemiesList) {
   ringMesh.position.set(px, 0.3, pz);
   gameState.scene.add(ringMesh);
   _activeVisuals.push({
+    id: _visualIdCounter++,
     mesh: ringMesh,
     timer: 0.3,
     type: "garlic",
+    area,
     owner: playerObj,
   });
 }
@@ -306,12 +315,32 @@ function _fireHolyWater(weapon, stats, playerObj, enemiesList) {
   }
 
   _activeVisuals.push({
+    id: _visualIdCounter++,
     mesh: poolMesh,
     timer: stats.duration,
     type: "holyWater",
+    area: stats.area,
     stats,
     damageTimer: 0.5,
   });
+}
+
+/**
+ * Return serializable state for all active weapon visuals (for network sync).
+ * @param {Array} playersList — the players array, used to resolve owner indices for garlic.
+ */
+export function getActiveVisualStates(playersList) {
+  return _activeVisuals.map((v) => ({
+    id: v.id,
+    t: v.type,
+    x: v.mesh.position.x,
+    y: v.mesh.position.y,
+    z: v.mesh.position.z,
+    rz: v.mesh.rotation.z,
+    a: v.area || 0,
+    op: v.mesh.material.opacity !== undefined ? v.mesh.material.opacity : 1,
+    oi: v.owner ? playersList.indexOf(v.owner) : -1,
+  }));
 }
 
 export function resetWeapons(playerObj) {
