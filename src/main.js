@@ -3,17 +3,24 @@
 import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { createPlayer, updatePlayer, resetPlayer } from "./player.js";
-import { updateCamera } from "./camera.js";
+import { updateCamera, resetCamera } from "./camera.js";
 import {
   createEnemyManager,
   updateEnemies,
+  updateEnemyProjectiles,
   resetEnemies,
   enemies,
+  getActiveBoss,
+  createBossIndicatorMesh,
+  BOSS_ATTACK_CONFIG,
+  getActiveEnemyProjectiles,
 } from "./enemyManager.js";
 import {
   createWaveDirector,
   updateWaveDirector,
   resetWaveDirector,
+  getCurrentWave,
+  onBossWave,
 } from "./waveDirector.js";
 import {
   createWeaponManager,
@@ -75,12 +82,16 @@ export const gameState = {
   camera: null,
   renderer: null,
   role: null, // 'host' or 'guest'
+  currentWave: 0,
+  bossActive: false,
+  bossHp: 0,
+  bossMaxHp: 0,
 };
 
 const ARENA_SIZE = 100;
 const ARENA_HALF = ARENA_SIZE / 2;
 const PLAYER_SIZE = 0.5;
-const STATE_SEND_INTERVAL = 1; // Send state every frame
+const STATE_SEND_INTERVAL = 3; // Send state every 3rd frame (~20 Hz at 60fps, interpolation handles smoothness)
 
 // Player configuration (up to 5)
 const COLOR_THEMES = ["blue", "red", "green", "purple", "orange"];
@@ -109,16 +120,18 @@ let _lobbyPlayerIndices = [];
 let _spectatingIndex = -1;
 let _spectatorHudEl = null;
 
-// Guest-side: latest state from the host
+// Guest-side: latest state from the host (buffered for smooth interpolation)
 let _currentHostState = null;
 let _previousHostState = null;
 let _currentStateTime = 0;
 let _previousStateTime = 0;
 let _guestLocalTime = 0;
+let _guestStateDirty = false; // true when a new state arrived but hasn't been blended yet
 const INTERPOLATION_DELAY = 0.01;
 const _guestEnemyMap = new Map();
-const _guestProjectiles = [];
-const _guestGems = [];
+const _guestProjectileMap = new Map();
+const _guestEnemyProjectileMap = new Map();
+const _guestGemMap = new Map();
 const _guestWeaponVisualMap = new Map();
 
 // ---------- Initialization ----------
@@ -162,8 +175,8 @@ async function init() {
   const directionalLight = new THREE.DirectionalLight(0xffffff, 1.2);
   directionalLight.position.set(5, 15, 7);
   directionalLight.castShadow = true;
-  directionalLight.shadow.mapSize.width = 2048;
-  directionalLight.shadow.mapSize.height = 2048;
+  directionalLight.shadow.mapSize.width = 1024;
+  directionalLight.shadow.mapSize.height = 1024;
   directionalLight.shadow.camera.near = 0.5;
   directionalLight.shadow.camera.far = 60;
   directionalLight.shadow.camera.left = -30;
@@ -298,6 +311,12 @@ async function init() {
     createWeaponManager();
     createXpManager(scene);
     createWaveDirector();
+
+    // Register boss wave announcement
+    onBossWave((waveNumber) => {
+      _showBossWaveAnnouncement(waveNumber);
+      send({ type: "boss_wave", wave: waveNumber });
+    });
 
     // All players start with Magic Wand
     for (const p of players) {
@@ -461,7 +480,7 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
   let _lastTime = performance.now();
 
   function loop() {
-    setTimeout(loop, 16);
+    requestAnimationFrame(loop);
 
     const now = performance.now();
     const rawDelta = (now - _lastTime) / 1000;
@@ -498,11 +517,20 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
     // --- Game systems ---
     updateWaveDirector(delta, players);
     updateEnemies(delta, players);
+
+    // Update boss state in gameState for HUD
+    const activeBoss = getActiveBoss();
+    gameState.bossActive = !!activeBoss;
+    gameState.bossHp = activeBoss ? activeBoss.hp : 0;
+    gameState.bossMaxHp = activeBoss ? activeBoss.maxHp : 0;
+    gameState.currentWave = getCurrentWave();
+
     for (const p of players) {
       updateWeapons(delta, p, enemies);
     }
     updateWeaponVisuals(delta, enemies);
     updateProjectiles(delta, enemies);
+    updateEnemyProjectiles(delta, players);
     updateXpGems(delta, players);
     updateParticles(delta);
 
@@ -561,11 +589,92 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
       });
     }
 
-    // --- Apply state updates ---
-    if (_currentHostState && !_previousHostState) {
-      _applyHostState(_currentHostState, scene, 1.0);
-      _previousHostState = _deepCloneState(_currentHostState);
-      _previousStateTime = _currentStateTime;
+    // --- Apply state updates with smooth interpolation ---
+    if (_currentHostState) {
+      if (!_previousHostState) {
+        // First state ever — snap everything to it
+        _applyHostState(_currentHostState, scene, 1.0);
+        _previousHostState = _deepCloneState(_currentHostState);
+        _previousStateTime = _currentStateTime;
+        _guestStateDirty = false;
+      } else {
+        // When a new state just arrived, sync entities (create/remove meshes)
+        // and update non-positional state. Positions will be interpolated below.
+        if (_guestStateDirty) {
+          // Sync entity lifecycle (creates new, removes old) — positions get overwritten by interpolation
+          _syncGuestEnemies(_currentHostState.en, scene, 1.0);
+          _syncGuestProjectiles(_currentHostState.pr, scene, 1.0);
+          if (_currentHostState.ep) {
+            _syncGuestEnemyProjectiles(_currentHostState.ep, scene);
+          }
+          _syncGuestGems(_currentHostState.gm, scene, 1.0);
+          if (_currentHostState.wv) {
+            _syncGuestWeaponVisuals(_currentHostState.wv, scene);
+          }
+          // Apply game-state scalars
+          gameState.gameTime = _currentHostState.gt;
+          gameState.totalKills = _currentHostState.tk;
+          gameState.gameOver = _currentHostState.go;
+          gameState.currentWave = _currentHostState.cw;
+          gameState.bossActive = _currentHostState.ba;
+          gameState.bossHp = _currentHostState.bh;
+          gameState.bossMaxHp = _currentHostState.bmh;
+          if (_currentHostState.go) _showGameOver();
+          _guestStateDirty = false;
+        }
+
+        // Smoothly interpolate positions every frame
+        if (_currentStateTime > _previousStateTime) {
+          const elapsed = performance.now() - _currentStateTime;
+          const interval = _currentStateTime - _previousStateTime;
+          const t = Math.min(Math.max(elapsed / interval, 0), 1);
+
+          // Interpolate player positions (main source of camera stutter)
+          for (let i = 0; i < players.length; i++) {
+            if (
+              _previousHostState.pl &&
+              _previousHostState.pl[i] &&
+              _currentHostState.pl &&
+              _currentHostState.pl[i]
+            ) {
+              _interpolatePlayerState(
+                players[i],
+                _previousHostState.pl[i],
+                _currentHostState.pl[i],
+                t,
+              );
+            }
+          }
+
+          // Interpolate enemy, projectile, and gem positions
+          _interpolateGuestEnemies(
+            _previousHostState.en,
+            _currentHostState.en,
+            scene,
+            t,
+          );
+          _interpolateGuestProjectiles(
+            _previousHostState.pr,
+            _currentHostState.pr,
+            scene,
+            t,
+          );
+          if (_previousHostState.ep && _currentHostState.ep) {
+            _interpolateGuestEnemyProjectiles(
+              _previousHostState.ep,
+              _currentHostState.ep,
+              scene,
+              t,
+            );
+          }
+          _interpolateGuestGems(
+            _previousHostState.gm,
+            _currentHostState.gm,
+            scene,
+            t,
+          );
+        }
+      }
     }
 
     // --- Continuously animate enemies and gems ---
@@ -612,17 +721,41 @@ function _sendGameState() {
       mhp: e.maxHp,
       ry: e.mesh.rotation.y,
       fl: e.flashTimer,
+      ...(e.isBoss
+        ? {
+            bs: e.bossState,
+            bat: e.bossAttackType,
+            bcp:
+              e.bossChargeDuration > 0
+                ? 1 - e.bossChargeTimer / e.bossChargeDuration
+                : 0,
+            btx: e.bossAttackTarget ? e.bossAttackTarget.x : 0,
+            btz: e.bossAttackTarget ? e.bossAttackTarget.z : 0,
+          }
+        : {}),
     })),
     pr: getActiveProjectiles().map((p) => ({
+      id: p.id,
       x: p.mesh.position.x,
       z: p.mesh.position.z,
     })),
+    ep: getActiveEnemyProjectiles().map((p) => ({
+      id: p.id,
+      x: p.mesh.position.x,
+      z: p.mesh.position.z,
+      c: p.mesh.material.color.getHex(),
+    })),
     gm: getActiveGems().map((g) => ({
+      id: g.id,
       x: g.mesh.position.x,
       y: g.mesh.position.y,
       z: g.mesh.position.z,
     })),
     wv: getActiveVisualStates(players),
+    cw: gameState.currentWave,
+    ba: gameState.bossActive,
+    bh: gameState.bossHp,
+    bmh: gameState.bossMaxHp,
   };
   send(state);
 }
@@ -644,7 +777,120 @@ function _serializePlayer(p) {
 // ---------- State Cloning (for interpolation) ----------
 
 function _deepCloneState(state) {
-  return JSON.parse(JSON.stringify(state));
+  // Manual clone avoids expensive JSON.parse/stringify overhead
+  const clone = {
+    type: state.type,
+    gt: state.gt,
+    tk: state.tk,
+    go: state.go,
+    pa: state.pa,
+    cw: state.cw,
+    ba: state.ba,
+    bh: state.bh,
+    bmh: state.bmh,
+  };
+
+  // Clone player states
+  if (state.pl) {
+    clone.pl = new Array(state.pl.length);
+    for (let i = 0; i < state.pl.length; i++) {
+      const p = state.pl[i];
+      clone.pl[i] = {
+        x: p.x,
+        z: p.z,
+        fa: p.fa,
+        hp: p.hp,
+        mhp: p.mhp,
+        xp: p.xp,
+        lv: p.lv,
+        al: p.al,
+        inv: p.inv,
+      };
+    }
+  }
+
+  // Clone enemy states
+  if (state.en) {
+    clone.en = new Array(state.en.length);
+    for (let i = 0; i < state.en.length; i++) {
+      const e = state.en[i];
+      clone.en[i] = {
+        id: e.id,
+        x: e.x,
+        z: e.z,
+        y: e.y,
+        tk: e.tk,
+        tn: e.tn,
+        sz: e.sz,
+        hp: e.hp,
+        mhp: e.mhp,
+        ry: e.ry,
+        fl: e.fl,
+      };
+      if (e.bs !== undefined) {
+        clone.en[i].bs = e.bs;
+        clone.en[i].bat = e.bat;
+        clone.en[i].bcp = e.bcp;
+        clone.en[i].btx = e.btx;
+        clone.en[i].btz = e.btz;
+      }
+    }
+  }
+
+  // Clone projectile states
+  if (state.pr) {
+    clone.pr = new Array(state.pr.length);
+    for (let i = 0; i < state.pr.length; i++) {
+      clone.pr[i] = { id: state.pr[i].id, x: state.pr[i].x, z: state.pr[i].z };
+    }
+  }
+
+  // Clone gem states
+  if (state.gm) {
+    clone.gm = new Array(state.gm.length);
+    for (let i = 0; i < state.gm.length; i++) {
+      clone.gm[i] = {
+        id: state.gm[i].id,
+        x: state.gm[i].x,
+        y: state.gm[i].y,
+        z: state.gm[i].z,
+      };
+    }
+  }
+
+  // Clone enemy projectile states
+  if (state.ep) {
+    clone.ep = new Array(state.ep.length);
+    for (let i = 0; i < state.ep.length; i++) {
+      clone.ep[i] = {
+        id: state.ep[i].id,
+        x: state.ep[i].x,
+        z: state.ep[i].z,
+        c: state.ep[i].c,
+      };
+    }
+  }
+
+  // Clone weapon visual states
+  if (state.wv) {
+    clone.wv = new Array(state.wv.length);
+    for (let i = 0; i < state.wv.length; i++) {
+      const v = state.wv[i];
+      clone.wv[i] = {
+        id: v.id,
+        t: v.t,
+        x: v.x,
+        y: v.y,
+        z: v.z,
+        rz: v.rz,
+        a: v.a,
+        op: v.op,
+        oi: v.oi,
+      };
+    }
+  }
+
+  return clone;
 }
 
 // ---------- State Deserialization (Guest receives Host state) ----------
@@ -653,6 +899,10 @@ function _applyHostState(state, scene, interpolationFactor) {
   gameState.gameTime = state.gt;
   gameState.totalKills = state.tk;
   gameState.gameOver = state.go;
+  gameState.currentWave = state.cw ?? gameState.currentWave;
+  gameState.bossActive = state.ba ?? false;
+  gameState.bossHp = state.bh ?? 0;
+  gameState.bossMaxHp = state.bmh ?? 0;
 
   // Update all players
   for (let i = 0; i < players.length && i < state.pl.length; i++) {
@@ -664,6 +914,11 @@ function _applyHostState(state, scene, interpolationFactor) {
 
   // Sync projectile meshes
   _syncGuestProjectiles(state.pr, scene, interpolationFactor);
+
+  // Sync enemy projectile meshes
+  if (state.ep) {
+    _syncGuestEnemyProjectiles(state.ep, scene);
+  }
 
   // Sync gem meshes
   _syncGuestGems(state.gm, scene, interpolationFactor);
@@ -694,6 +949,9 @@ function _interpolateHostState(prevState, currState, scene, t) {
 
   _interpolateGuestEnemies(prevState.en, currState.en, scene, t);
   _interpolateGuestProjectiles(prevState.pr, currState.pr, scene, t);
+  if (prevState.ep && currState.ep) {
+    _interpolateGuestEnemyProjectiles(prevState.ep, currState.ep, scene, t);
+  }
   _interpolateGuestGems(prevState.gm, currState.gm, scene, t);
 }
 
@@ -786,12 +1044,18 @@ function _syncGuestEnemies(enemyStates, scene, interpolationFactor) {
     } else {
       unflashGroup(entry.mesh);
     }
+
+    // Boss indicator sync (guest side)
+    if (es.tk === "boss") {
+      _syncGuestBossIndicator(entry, es, scene);
+    }
   }
 
   for (const [id, entry] of _guestEnemyMap) {
     if (!activeIds.has(id)) {
       entry.mesh.visible = false;
       scene.remove(entry.mesh);
+      _removeGuestBossIndicator(entry, scene);
       _guestEnemyMap.delete(id);
     }
   }
@@ -854,21 +1118,33 @@ function _animateGuestEnemies(localTime) {
 }
 
 function _syncGuestProjectiles(projStates, scene, interpolationFactor) {
-  while (_guestProjectiles.length < projStates.length) {
-    const geo = new THREE.SphereGeometry(0.15, 6, 6);
-    const mat = new THREE.MeshBasicMaterial({ color: 0x44ccff });
-    const mesh = new THREE.Mesh(geo, mat);
-    scene.add(mesh);
-    _guestProjectiles.push(mesh);
+  const activeIds = new Set();
+
+  for (const ps of projStates) {
+    activeIds.add(ps.id);
+
+    let entry = _guestProjectileMap.get(ps.id);
+    if (!entry) {
+      const geo = new THREE.SphereGeometry(0.15, 6, 6);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x44ccff });
+      const mesh = new THREE.Mesh(geo, mat);
+      scene.add(mesh);
+      entry = { mesh };
+      _guestProjectileMap.set(ps.id, entry);
+    }
+
+    entry.mesh.position.set(ps.x, 0.8, ps.z);
+    entry.mesh.visible = true;
   }
 
-  for (let i = 0; i < projStates.length; i++) {
-    _guestProjectiles[i].position.set(projStates[i].x, 0.8, projStates[i].z);
-    _guestProjectiles[i].visible = true;
-  }
-
-  for (let i = projStates.length; i < _guestProjectiles.length; i++) {
-    _guestProjectiles[i].visible = false;
+  for (const [id, entry] of _guestProjectileMap) {
+    if (!activeIds.has(id)) {
+      entry.mesh.visible = false;
+      scene.remove(entry.mesh);
+      if (entry.mesh.geometry) entry.mesh.geometry.dispose();
+      if (entry.mesh.material) entry.mesh.material.dispose();
+      _guestProjectileMap.delete(id);
+    }
   }
 }
 
@@ -878,70 +1154,211 @@ function _interpolateGuestProjectiles(
   scene,
   t,
 ) {
-  const maxLen = Math.min(currProjStates.length, _guestProjectiles.length);
-  for (let i = 0; i < maxLen; i++) {
-    const proj = _guestProjectiles[i];
-    const prevP = i < prevProjStates.length ? prevProjStates[i] : null;
-    const currP = currProjStates[i];
+  // Build a lookup map for previous state by ID
+  const prevMap = new Map();
+  for (const ps of prevProjStates) {
+    prevMap.set(ps.id, ps);
+  }
 
+  for (const currP of currProjStates) {
+    const entry = _guestProjectileMap.get(currP.id);
+    if (!entry) continue;
+
+    const prevP = prevMap.get(currP.id);
     if (!prevP) {
-      proj.position.set(currP.x, 0.8, currP.z);
+      entry.mesh.position.set(currP.x, 0.8, currP.z);
     } else {
-      proj.position.x = prevP.x + (currP.x - prevP.x) * t;
-      proj.position.z = prevP.z + (currP.z - prevP.z) * t;
-      proj.position.y = 0.8;
+      entry.mesh.position.x = prevP.x + (currP.x - prevP.x) * t;
+      entry.mesh.position.z = prevP.z + (currP.z - prevP.z) * t;
+      entry.mesh.position.y = 0.8;
+    }
+  }
+}
+
+function _syncGuestEnemyProjectiles(projStates, scene) {
+  const activeIds = new Set();
+
+  for (const ps of projStates) {
+    activeIds.add(ps.id);
+
+    let entry = _guestEnemyProjectileMap.get(ps.id);
+    if (!entry) {
+      const geo = new THREE.SphereGeometry(0.12, 6, 6);
+      const mat = new THREE.MeshBasicMaterial({
+        color: ps.c || 0xdd55ff,
+        transparent: true,
+        opacity: 1,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      scene.add(mesh);
+      entry = { mesh };
+      _guestEnemyProjectileMap.set(ps.id, entry);
+    }
+
+    entry.mesh.position.set(ps.x, 0.8, ps.z);
+    entry.mesh.material.color.setHex(ps.c || 0xdd55ff);
+    entry.mesh.visible = true;
+  }
+
+  for (const [id, entry] of _guestEnemyProjectileMap) {
+    if (!activeIds.has(id)) {
+      entry.mesh.visible = false;
+      scene.remove(entry.mesh);
+      if (entry.mesh.geometry) entry.mesh.geometry.dispose();
+      if (entry.mesh.material) entry.mesh.material.dispose();
+      _guestEnemyProjectileMap.delete(id);
+    }
+  }
+}
+
+function _interpolateGuestEnemyProjectiles(
+  prevProjStates,
+  currProjStates,
+  scene,
+  t,
+) {
+  // Build a lookup map for previous state by ID
+  const prevMap = new Map();
+  for (const ps of prevProjStates) {
+    prevMap.set(ps.id, ps);
+  }
+
+  for (const currP of currProjStates) {
+    const entry = _guestEnemyProjectileMap.get(currP.id);
+    if (!entry) continue;
+
+    const prevP = prevMap.get(currP.id);
+    if (!prevP) {
+      entry.mesh.position.set(currP.x, 0.8, currP.z);
+    } else {
+      entry.mesh.position.x = prevP.x + (currP.x - prevP.x) * t;
+      entry.mesh.position.z = prevP.z + (currP.z - prevP.z) * t;
+      entry.mesh.position.y = 0.8;
     }
   }
 }
 
 function _syncGuestGems(gemStates, scene, interpolationFactor) {
-  while (_guestGems.length < gemStates.length) {
-    const geo = new THREE.OctahedronGeometry(0.15, 0);
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0x44aaff,
-      emissive: 0x44aaff,
-      emissiveIntensity: 0.5,
-      roughness: 0.3,
-      metalness: 0.8,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    scene.add(mesh);
-    _guestGems.push(mesh);
+  const activeIds = new Set();
+
+  for (const gs of gemStates) {
+    activeIds.add(gs.id);
+
+    let entry = _guestGemMap.get(gs.id);
+    if (!entry) {
+      const geo = new THREE.OctahedronGeometry(0.15, 0);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x44aaff,
+        emissive: 0x44aaff,
+        emissiveIntensity: 0.5,
+        roughness: 0.3,
+        metalness: 0.8,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      scene.add(mesh);
+      entry = { mesh };
+      _guestGemMap.set(gs.id, entry);
+    }
+
+    entry.mesh.position.set(gs.x, gs.y, gs.z);
+    entry.mesh.visible = true;
   }
 
-  for (let i = 0; i < gemStates.length; i++) {
-    const g = gemStates[i];
-    _guestGems[i].position.set(g.x, g.y, g.z);
-    _guestGems[i].visible = true;
-  }
-
-  for (let i = gemStates.length; i < _guestGems.length; i++) {
-    _guestGems[i].visible = false;
+  for (const [id, entry] of _guestGemMap) {
+    if (!activeIds.has(id)) {
+      entry.mesh.visible = false;
+      scene.remove(entry.mesh);
+      if (entry.mesh.geometry) entry.mesh.geometry.dispose();
+      if (entry.mesh.material) entry.mesh.material.dispose();
+      _guestGemMap.delete(id);
+    }
   }
 }
 
 function _interpolateGuestGems(prevGemStates, currGemStates, scene, t) {
-  const maxLen = Math.min(currGemStates.length, _guestGems.length);
-  for (let i = 0; i < maxLen; i++) {
-    const gem = _guestGems[i];
-    const prevG = i < prevGemStates.length ? prevGemStates[i] : null;
-    const currG = currGemStates[i];
+  // Build a lookup map for previous state by ID
+  const prevMap = new Map();
+  for (const gs of prevGemStates) {
+    prevMap.set(gs.id, gs);
+  }
 
+  for (const currG of currGemStates) {
+    const entry = _guestGemMap.get(currG.id);
+    if (!entry) continue;
+
+    const prevG = prevMap.get(currG.id);
     if (!prevG) {
-      gem.position.set(currG.x, currG.y, currG.z);
+      entry.mesh.position.set(currG.x, currG.y, currG.z);
     } else {
-      gem.position.x = prevG.x + (currG.x - prevG.x) * t;
-      gem.position.y = prevG.y + (currG.y - prevG.y) * t;
-      gem.position.z = prevG.z + (currG.z - prevG.z) * t;
+      entry.mesh.position.x = prevG.x + (currG.x - prevG.x) * t;
+      entry.mesh.position.y = prevG.y + (currG.y - prevG.y) * t;
+      entry.mesh.position.z = prevG.z + (currG.z - prevG.z) * t;
     }
   }
 }
 
 function _animateGuestGems(delta) {
-  for (const gem of _guestGems) {
-    if (gem.visible) {
-      gem.rotation.y += delta * 2;
+  for (const [, entry] of _guestGemMap) {
+    if (entry.mesh.visible) {
+      entry.mesh.rotation.y += delta * 2;
     }
+  }
+}
+
+// ---------- Guest Boss Indicator Sync ----------
+
+function _syncGuestBossIndicator(entry, es, scene) {
+  if (es.bs === "charging" && es.bat) {
+    // Create indicator if needed or type changed
+    if (!entry.bossIndicator || entry.bossIndicatorType !== es.bat) {
+      _removeGuestBossIndicator(entry, scene);
+      const mesh = createBossIndicatorMesh(es.bat);
+      if (mesh) {
+        scene.add(mesh);
+        entry.bossIndicator = mesh;
+        entry.bossIndicatorType = es.bat;
+      }
+    }
+    // Update indicator position, rotation, opacity
+    if (entry.bossIndicator) {
+      const progress = es.bcp || 0;
+      const pulse = 0.5 + Math.sin(progress * Math.PI * 6) * 0.3;
+      const opacity = 0.1 + progress * 0.5 * pulse;
+
+      switch (es.bat) {
+        case "cone":
+          entry.bossIndicator.position.set(es.x, 0.15, es.z);
+          entry.bossIndicator.rotation.z = -es.ry;
+          entry.bossIndicator.material.opacity = opacity;
+          break;
+        case "rangedCircle":
+          entry.bossIndicator.position.set(es.btx, 0.15, es.btz);
+          entry.bossIndicator.material.opacity = opacity;
+          entry.bossIndicator.scale.setScalar(0.3 + progress * 0.7);
+          break;
+        case "stomp":
+          entry.bossIndicator.position.set(es.x, 0.15, es.z);
+          entry.bossIndicator.material.opacity = opacity;
+          entry.bossIndicator.scale.setScalar(0.3 + progress * 0.7);
+          break;
+      }
+    }
+  } else if (es.bs === "attacking" && entry.bossIndicator) {
+    // Flash white during attack frame
+    entry.bossIndicator.material.opacity = 0.9;
+    entry.bossIndicator.material.color.setHex(0xffffff);
+  } else {
+    _removeGuestBossIndicator(entry, scene);
+  }
+}
+
+function _removeGuestBossIndicator(entry, scene) {
+  if (entry.bossIndicator) {
+    scene.remove(entry.bossIndicator);
+    if (entry.bossIndicator.geometry) entry.bossIndicator.geometry.dispose();
+    if (entry.bossIndicator.material) entry.bossIndicator.material.dispose();
+    entry.bossIndicator = null;
+    entry.bossIndicatorType = null;
   }
 }
 
@@ -1089,10 +1506,8 @@ function _handleGuestMessage(msg) {
       }
       _currentHostState = _deepCloneState(msg);
       _currentStateTime = now;
-
-      if (gameState.scene) {
-        _applyHostState(_currentHostState, gameState.scene, 1.0);
-      }
+      _guestStateDirty = true;
+      // Don't apply immediately — the guest render loop will interpolate smoothly
       break;
     }
 
@@ -1119,6 +1534,10 @@ function _handleGuestMessage(msg) {
       }
       break;
     }
+
+    case "boss_wave":
+      _showBossWaveAnnouncement(msg.wave);
+      break;
 
     case "game_over":
       gameState.gameOver = true;
@@ -1564,6 +1983,51 @@ function _hideLobby() {
 
 function _delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------- Boss Wave Announcement ----------
+
+function _showBossWaveAnnouncement(waveNumber) {
+  const bossLevel = Math.floor(waveNumber / 5);
+
+  // Add CSS animation if not already added
+  if (!document.getElementById("boss-announce-style")) {
+    const style = document.createElement("style");
+    style.id = "boss-announce-style";
+    style.textContent = `
+      @keyframes bossAnnounce {
+        0% { opacity: 0; transform: scale(0.5); }
+        15% { opacity: 1; transform: scale(1.05); }
+        30% { opacity: 1; transform: scale(1); }
+        85% { opacity: 1; transform: scale(1); }
+        100% { opacity: 0; transform: scale(1.1); }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  const el = document.createElement("div");
+  el.style.cssText = `
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    z-index: 800; pointer-events: none;
+  `;
+  el.innerHTML = `
+    <div style="font-size: 56px; font-weight: bold; color: #ff0044;
+      text-shadow: 0 0 30px #ff000088, 0 0 60px #ff000044;
+      font-family: 'Segoe UI', sans-serif; letter-spacing: 4px;
+      animation: bossAnnounce 2.5s ease-out forwards;">
+      BOSS WAVE!
+    </div>
+    <div style="font-size: 24px; color: #ffcc00; margin-top: 8px;
+      text-shadow: 0 0 10px #ffcc0066;
+      font-family: 'Segoe UI', sans-serif;
+      animation: bossAnnounce 2.5s ease-out 0.3s forwards;">
+      Wave ${waveNumber} &mdash; Boss Level ${bossLevel}
+    </div>
+  `;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
 }
 
 // ---------- Game Over Screen ----------

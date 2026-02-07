@@ -74,7 +74,10 @@ export function updateParticles(delta) {
     if (p.lifetime <= 0) {
       p.mesh.visible = false;
       pool.push(p);
-      particles.splice(i, 1);
+      // Swap-and-pop: O(1) removal instead of O(n) splice
+      const last = particles[particles.length - 1];
+      particles[i] = last;
+      particles.pop();
       continue;
     }
 

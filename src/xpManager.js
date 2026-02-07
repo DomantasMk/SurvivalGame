@@ -10,6 +10,9 @@ let scene;
 const gems = [];
 const pool = [];
 
+// Unique ID counter for network sync
+let _nextGemId = 1;
+
 // Callback for level-up events (set by main.js)
 let _levelUpCallback = null;
 
@@ -76,6 +79,7 @@ function _createGem(x, z, value, tier) {
   scene.add(mesh);
 
   return {
+    id: _nextGemId++,
     mesh,
     value,
     attracting: false,
@@ -85,6 +89,7 @@ function _createGem(x, z, value, tier) {
 }
 
 function _resetGem(gem, x, z, value, tier) {
+  gem.id = _nextGemId++;
   gem.value = value;
   gem.attracting = false;
   gem.attractTarget = null;

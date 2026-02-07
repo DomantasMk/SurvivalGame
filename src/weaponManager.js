@@ -105,7 +105,10 @@ export function updateWeaponVisuals(delta, enemiesList) {
       gameState.scene.remove(v.mesh);
       if (v.mesh.geometry) v.mesh.geometry.dispose();
       if (v.mesh.material) v.mesh.material.dispose();
-      _activeVisuals.splice(i, 1);
+      // Swap-and-pop: O(1) removal
+      const last = _activeVisuals[_activeVisuals.length - 1];
+      _activeVisuals[i] = last;
+      _activeVisuals.pop();
     } else {
       // Fade out
       if (v.mesh.material.opacity !== undefined) {
@@ -144,32 +147,54 @@ function _fireWeapon(weapon, playerObj, enemiesList) {
 }
 
 // --- Magic Wand: fire projectile(s) toward nearest enemies ---
+// Reusable buffer for nearest-enemy search (avoids per-fire allocations)
+const _nearestBuf = [];
+
 function _fireMagicWand(weapon, stats, playerObj, enemiesList) {
   if (enemiesList.length === 0) {
     weapon.cooldownTimer = 0.2; // Retry quickly if no enemies
     return;
   }
 
-  // Find nearest enemies
-  const sorted = [...enemiesList]
-    .filter((e) => e.alive)
-    .sort(
-      (a, b) =>
-        distXZ(a.mesh.position, playerObj.mesh.position) -
-        distXZ(b.mesh.position, playerObj.mesh.position),
-    );
-
+  // Find N nearest alive enemies without copying/sorting the entire array
   const count = stats.projectileCount;
-  for (let i = 0; i < count && i < sorted.length; i++) {
-    const target = sorted[i];
-    const dx = target.mesh.position.x - playerObj.mesh.position.x;
-    const dz = target.mesh.position.z - playerObj.mesh.position.z;
+  _nearestBuf.length = 0;
+
+  const px = playerObj.mesh.position.x;
+  const pz = playerObj.mesh.position.z;
+
+  for (let i = 0; i < enemiesList.length; i++) {
+    const e = enemiesList[i];
+    if (!e.alive) continue;
+    const dx = e.mesh.position.x - px;
+    const dz = e.mesh.position.z - pz;
+    const d2 = dx * dx + dz * dz;
+
+    if (_nearestBuf.length < count) {
+      _nearestBuf.push({ e, d2 });
+      // Keep the buffer sorted (small N, so insertion is cheap)
+      if (
+        _nearestBuf.length > 1 &&
+        d2 < _nearestBuf[_nearestBuf.length - 2].d2
+      ) {
+        _nearestBuf.sort((a, b) => a.d2 - b.d2);
+      }
+    } else if (d2 < _nearestBuf[_nearestBuf.length - 1].d2) {
+      _nearestBuf[_nearestBuf.length - 1] = { e, d2 };
+      _nearestBuf.sort((a, b) => a.d2 - b.d2);
+    }
+  }
+
+  for (let i = 0; i < _nearestBuf.length; i++) {
+    const target = _nearestBuf[i].e;
+    const dx = target.mesh.position.x - px;
+    const dz = target.mesh.position.z - pz;
     const len = Math.sqrt(dx * dx + dz * dz);
     if (len < 0.01) continue;
 
     fireProjectile({
-      x: playerObj.mesh.position.x,
-      z: playerObj.mesh.position.z,
+      x: px,
+      z: pz,
       dirX: dx / len,
       dirZ: dz / len,
       speed: stats.speed,
@@ -296,7 +321,7 @@ function _fireHolyWater(weapon, stats, playerObj, enemiesList) {
   const poolMat = new THREE.MeshBasicMaterial({
     color: 0x4488ff,
     transparent: true,
-    opacity: 0.6,
+    opacity: 0.4,
     side: THREE.DoubleSide,
     depthWrite: false,
   });

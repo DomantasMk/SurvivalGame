@@ -1,17 +1,21 @@
-// waveDirector.js — Wave timing, difficulty scaling over time (multiplayer)
+// waveDirector.js — Wave timing, difficulty scaling, boss waves every 5th wave (multiplayer)
 
 import { spawnEnemy, ENEMY_TYPES } from "./enemyManager.js";
 import { randomRange } from "./utils.js";
 import { gameState } from "./main.js";
 
 let spawnTimer = 0;
-let bossTimer = 0;
+let currentWave = 0;
+
+// Boss wave announcement callback
+let _bossWaveCallback = null;
 
 // Difficulty configuration
-const BASE_SPAWN_INTERVAL = 2.0; // seconds between spawn waves
+const BASE_SPAWN_INTERVAL = 2.0; // seconds between spawn bursts
 const MIN_SPAWN_INTERVAL = 0.5;
 const BASE_ENEMIES_PER_WAVE = 2;
-const BOSS_INTERVAL = 360; // 6 minutes
+const WAVE_DURATION = 30; // seconds per wave number increment
+const BOSS_WAVE_INTERVAL = 5; // boss every 5 waves (5, 10, 15, ...)
 
 const SPAWN_DISTANCE_MIN = 18;
 const SPAWN_DISTANCE_MAX = 25;
@@ -21,7 +25,15 @@ const ARENA_HALF = 50;
 
 export function createWaveDirector() {
   spawnTimer = 0;
-  bossTimer = 0;
+  currentWave = 0;
+}
+
+export function getCurrentWave() {
+  return currentWave;
+}
+
+export function onBossWave(callback) {
+  _bossWaveCallback = callback;
 }
 
 /**
@@ -31,6 +43,19 @@ export function createWaveDirector() {
  */
 export function updateWaveDirector(delta, players) {
   const time = gameState.gameTime;
+
+  // --- Track wave number ---
+  const newWave = Math.floor(time / WAVE_DURATION) + 1;
+  if (newWave > currentWave) {
+    const prevWave = currentWave;
+    currentWave = newWave;
+
+    // Check for boss wave (every 5th wave)
+    if (currentWave % BOSS_WAVE_INTERVAL === 0 && currentWave > prevWave) {
+      _spawnBossWave(players, currentWave);
+      if (_bossWaveCallback) _bossWaveCallback(currentWave);
+    }
+  }
 
   // --- Compute current difficulty ---
   const difficultyFactor = Math.min(time / 900, 1); // ramp over 15 minutes to max
@@ -49,13 +74,6 @@ export function updateWaveDirector(delta, players) {
   if (spawnTimer <= 0) {
     spawnTimer = spawnInterval;
     _spawnWave(players, enemiesPerWave, time);
-  }
-
-  // --- Boss timer ---
-  bossTimer += delta;
-  if (bossTimer >= BOSS_INTERVAL) {
-    bossTimer -= BOSS_INTERVAL;
-    _spawnBoss(players);
   }
 }
 
@@ -128,14 +146,21 @@ function _spawnWave(players, count, time) {
     // Choose enemy type based on game time
     let type = "bat";
     if (time >= 270) {
-      // After 4.5 min: mix of all normal types
+      // After 4.5 min: mix of all normal types including imps
       const roll = Math.random();
-      if (roll < 0.25) type = "zombie";
-      else if (roll < 0.55) type = "skeleton";
+      if (roll < 0.2) type = "zombie";
+      else if (roll < 0.45) type = "skeleton";
+      else if (roll < 0.65) type = "imp";
       else type = "bat";
     } else if (time >= 90) {
-      // After 1.5 min: bats and skeletons
-      type = Math.random() < 0.4 ? "skeleton" : "bat";
+      // After 1.5 min: bats, skeletons, and imps
+      const roll = Math.random();
+      if (roll < 0.3) type = "skeleton";
+      else if (roll < 0.5) type = "imp";
+      else type = "bat";
+    } else {
+      // Wave 1+: bats and imps
+      type = Math.random() < 0.3 ? "imp" : "bat";
     }
 
     // Scale HP with difficulty
@@ -143,7 +168,12 @@ function _spawnWave(players, count, time) {
   }
 }
 
-function _spawnBoss(players) {
+/**
+ * Spawn a boss wave: one boss + minion escort.
+ * Boss stats scale with wave level (wave 5 = level 1, wave 10 = level 2, etc.)
+ */
+function _spawnBossWave(players, waveNumber) {
+  const bossLevel = Math.floor(waveNumber / BOSS_WAVE_INTERVAL);
   const alivePlayers = players.filter((p) => p.alive);
   const target =
     alivePlayers.length > 0
@@ -151,6 +181,8 @@ function _spawnBoss(players) {
       : null;
   const px = target ? target.mesh.position.x : 0;
   const pz = target ? target.mesh.position.z : 0;
+
+  // Spawn boss
   const { x: bx, z: bz } = _safeSpawnPosition(
     px,
     pz,
@@ -158,10 +190,42 @@ function _spawnBoss(players) {
     SPAWN_DISTANCE_MAX,
     SPAWN_DISTANCE_MAX + 5,
   );
-  spawnEnemy("boss", bx, bz);
+  const boss = spawnEnemy("boss", bx, bz);
+  if (boss) {
+    // Scale boss HP and damage based on wave level and player count
+    const hpMultiplier = 1 + (bossLevel - 1) * 0.5;
+    const playerScale = 1 + (alivePlayers.length - 1) * 0.4;
+    boss.hp = Math.floor(ENEMY_TYPES.boss.hp * hpMultiplier * playerScale);
+    boss.maxHp = boss.hp;
+    boss.damage = Math.floor(
+      ENEMY_TYPES.boss.damage * (1 + (bossLevel - 1) * 0.3),
+    );
+    boss.bossWaveLevel = bossLevel;
+    boss.xpValue = Math.floor(
+      ENEMY_TYPES.boss.xpValue * (1 + (bossLevel - 1) * 0.5),
+    );
+  }
+
+  // Spawn minion escorts around the boss
+  const minionCount = 4 + bossLevel * 2;
+  const minionTypes = ["bat", "skeleton", "zombie", "imp"];
+  for (let i = 0; i < minionCount; i++) {
+    const angle = (i / minionCount) * Math.PI * 2;
+    const dist = 3 + Math.random() * 2;
+    const mx = Math.max(
+      -ARENA_HALF,
+      Math.min(ARENA_HALF, bx + Math.cos(angle) * dist),
+    );
+    const mz = Math.max(
+      -ARENA_HALF,
+      Math.min(ARENA_HALF, bz + Math.sin(angle) * dist),
+    );
+    const type = minionTypes[Math.floor(Math.random() * minionTypes.length)];
+    spawnEnemy(type, mx, mz);
+  }
 }
 
 export function resetWaveDirector() {
   spawnTimer = 0;
-  bossTimer = 0;
+  currentWave = 0;
 }

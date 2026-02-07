@@ -4,7 +4,8 @@ import { getXpForNextLevel } from "./xpManager.js";
 
 let container;
 let xpBar, levelText;
-let timerText, killText;
+let timerText, killText, waveText;
+let bossBarContainer, bossBar, bossHpText;
 
 // Dynamic arrays for N player HP bars
 const _hpBars = []; // { bar, text } per player
@@ -41,7 +42,7 @@ export function createHud(playerCount, hexColors) {
     gap: 4px;
   `;
 
-  // Top row: timer and kill count
+  // Top row: timer, wave, and kill count
   const topRow = document.createElement("div");
   topRow.style.cssText = `display: flex; justify-content: space-between; align-items: center;`;
 
@@ -49,11 +50,16 @@ export function createHud(playerCount, hexColors) {
   timerText.style.cssText = `color: #fff; font-size: 22px; font-weight: bold; text-shadow: 0 1px 4px #000;`;
   timerText.textContent = "00:00";
 
+  waveText = document.createElement("div");
+  waveText.style.cssText = `color: #ffcc00; font-size: 18px; font-weight: bold; text-shadow: 0 1px 4px #000; letter-spacing: 1px;`;
+  waveText.textContent = "Wave 1";
+
   killText = document.createElement("div");
   killText.style.cssText = `color: #ff8888; font-size: 18px; font-weight: bold; text-shadow: 0 1px 4px #000;`;
   killText.textContent = "Kills: 0";
 
   topRow.appendChild(timerText);
+  topRow.appendChild(waveText);
   topRow.appendChild(killText);
   container.appendChild(topRow);
 
@@ -132,6 +138,53 @@ export function createHud(playerCount, hexColors) {
   container.appendChild(xpContainer);
 
   document.body.appendChild(container);
+
+  // --- Boss HP Bar (centered at top, hidden by default) ---
+  bossBarContainer = document.createElement("div");
+  bossBarContainer.style.cssText = `
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    width: 400px; display: none; flex-direction: column; align-items: center;
+    z-index: 150; pointer-events: none;
+    font-family: 'Segoe UI', Tahoma, sans-serif;
+  `;
+
+  const bossLabel = document.createElement("div");
+  bossLabel.style.cssText = `
+    color: #ff4444; font-size: 14px; font-weight: bold;
+    text-shadow: 0 0 10px #ff000066; margin-bottom: 3px;
+    letter-spacing: 3px;
+  `;
+  bossLabel.textContent = "BOSS";
+  bossBarContainer.appendChild(bossLabel);
+
+  const bossBarBg = document.createElement("div");
+  bossBarBg.style.cssText = `
+    width: 100%; height: 18px;
+    background: rgba(0,0,0,0.6);
+    border-radius: 9px; overflow: hidden;
+    border: 2px solid #ff444488;
+    position: relative;
+  `;
+
+  bossBar = document.createElement("div");
+  bossBar.style.cssText = `
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, #cc0022, #ff2244);
+    border-radius: 9px;
+    transition: width 0.15s;
+  `;
+  bossBarBg.appendChild(bossBar);
+
+  bossHpText = document.createElement("div");
+  bossHpText.style.cssText = `
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 11px; font-weight: bold;
+    text-shadow: 0 1px 2px #000;
+  `;
+  bossBarBg.appendChild(bossHpText);
+  bossBarContainer.appendChild(bossBarBg);
+  document.body.appendChild(bossBarContainer);
 }
 
 /**
@@ -163,6 +216,26 @@ export function updateHud(localPlayer, allPlayers, gameState) {
   const s = totalSec % 60;
   timerText.textContent = `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 
+  // Wave number
+  if (waveText) {
+    waveText.textContent = `Wave ${gameState.currentWave || 1}`;
+  }
+
   // Kills (shared)
   killText.textContent = `Kills: ${gameState.totalKills}`;
+
+  // Boss HP bar
+  if (bossBarContainer) {
+    if (gameState.bossActive && gameState.bossMaxHp > 0) {
+      bossBarContainer.style.display = "flex";
+      const bossPct = Math.max(
+        0,
+        (gameState.bossHp / gameState.bossMaxHp) * 100,
+      );
+      bossBar.style.width = `${bossPct}%`;
+      bossHpText.textContent = `${Math.ceil(gameState.bossHp)} / ${gameState.bossMaxHp}`;
+    } else {
+      bossBarContainer.style.display = "none";
+    }
+  }
 }

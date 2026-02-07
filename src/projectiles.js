@@ -12,6 +12,9 @@ const projectiles = [];
 // Object pool
 const pool = [];
 
+// Unique ID counter for network sync
+let _nextProjId = 1;
+
 const HIT_RADIUS = 0.6; // collision radius for projectile vs enemy
 
 export function createProjectileManager(s, w) {
@@ -46,6 +49,7 @@ function _createProjectile(opts) {
   scene.add(mesh);
 
   return {
+    id: _nextProjId++,
     mesh,
     dirX: opts.dirX,
     dirZ: opts.dirZ,
@@ -60,6 +64,7 @@ function _createProjectile(opts) {
 }
 
 function _resetProjectile(proj, opts) {
+  proj.id = _nextProjId++;
   proj.mesh.position.set(opts.x, 0.8, opts.z);
   proj.mesh.material.color.setHex(opts.color || 0x44ccff);
   proj.dirX = opts.dirX;

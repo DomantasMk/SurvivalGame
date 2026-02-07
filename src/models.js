@@ -105,6 +105,8 @@ function _setDefaults(pivot) {
 // ── Flash helpers (for damage flash on groups) ──────────────────
 
 export function flashGroup(group) {
+  if (group.userData._isFlashed) return; // Already flashed, skip traversal
+  group.userData._isFlashed = true;
   group.traverse((child) => {
     if (child.isMesh && child.userData.flashable) {
       child.material.color.setHex(0xffffff);
@@ -113,6 +115,8 @@ export function flashGroup(group) {
 }
 
 export function unflashGroup(group) {
+  if (!group.userData._isFlashed) return; // Already normal, skip traversal
+  group.userData._isFlashed = false;
   group.traverse((child) => {
     if (
       child.isMesh &&
@@ -466,6 +470,110 @@ export function createZombieModel(s) {
   };
 }
 
+// ── Imp Model (Ranged Spellcaster) ─────────────────────────────
+
+export function createImpModel(s) {
+  const group = new THREE.Group();
+
+  const BODY = 0x9933cc;
+  const SKIN = 0xcc44ff;
+  const DARK = 0x661199;
+  const EYE = 0x44ffcc;
+  const HORN = 0x442255;
+  const ORB = 0xdd55ff;
+
+  // Head (slightly oversized for a small creature)
+  _sphere(group, s * 0.28, SKIN, 0, s * 0.42, 0);
+
+  // Horns (small, curved forward)
+  _cone(group, s * 0.04, s * 0.14, 4, HORN, -s * 0.14, s * 0.58, s * 0.02, {
+    rz: 0.35,
+    rx: -0.2,
+  });
+  _cone(group, s * 0.04, s * 0.14, 4, HORN, s * 0.14, s * 0.58, s * 0.02, {
+    rz: -0.35,
+    rx: -0.2,
+  });
+
+  // Eyes (glowing teal — magical)
+  _sphere(group, s * 0.06, EYE, -s * 0.1, s * 0.46, s * 0.2, {
+    flashable: false,
+    emissive: 0x44ffcc,
+    emissiveIntensity: 0.7,
+  });
+  _sphere(group, s * 0.06, EYE, s * 0.1, s * 0.46, s * 0.2, {
+    flashable: false,
+    emissive: 0x44ffcc,
+    emissiveIntensity: 0.7,
+  });
+
+  // Grinning mouth
+  _box(group, s * 0.12, s * 0.03, s * 0.05, 0x220033, 0, s * 0.34, s * 0.2, {
+    flashable: false,
+  });
+
+  // Torso (small and hunched)
+  _box(group, s * 0.28, s * 0.24, s * 0.2, BODY, 0, s * 0.1, 0, {
+    rx: 0.1,
+  });
+
+  // Belly marking
+  _box(group, s * 0.16, s * 0.12, s * 0.01, DARK, 0, s * 0.06, s * 0.11);
+
+  // Arms (with pivots for casting animation)
+  const leftArmPivot = _pivot(group, -s * 0.2, s * 0.18, 0);
+  leftArmPivot.rotation.x = -0.4;
+  leftArmPivot.rotation.z = 0.3;
+  _box(leftArmPivot, s * 0.07, s * 0.25, s * 0.07, SKIN, 0, -s * 0.13, 0);
+  // Glowing hand orb
+  _sphere(leftArmPivot, s * 0.05, ORB, 0, -s * 0.28, 0, {
+    emissive: 0xdd55ff,
+    emissiveIntensity: 0.8,
+  });
+  _setDefaults(leftArmPivot);
+
+  const rightArmPivot = _pivot(group, s * 0.2, s * 0.18, 0);
+  rightArmPivot.rotation.x = -0.4;
+  rightArmPivot.rotation.z = -0.3;
+  _box(rightArmPivot, s * 0.07, s * 0.25, s * 0.07, SKIN, 0, -s * 0.13, 0);
+  // Glowing hand orb
+  _sphere(rightArmPivot, s * 0.05, ORB, 0, -s * 0.28, 0, {
+    emissive: 0xdd55ff,
+    emissiveIntensity: 0.8,
+  });
+  _setDefaults(rightArmPivot);
+
+  // Legs (stubby)
+  const leftLegPivot = _pivot(group, -s * 0.08, -s * 0.06, 0);
+  _box(leftLegPivot, s * 0.09, s * 0.2, s * 0.09, DARK, 0, -s * 0.1, 0);
+  _box(leftLegPivot, s * 0.1, s * 0.04, s * 0.12, HORN, 0, -s * 0.22, s * 0.02);
+  _setDefaults(leftLegPivot);
+
+  const rightLegPivot = _pivot(group, s * 0.08, -s * 0.06, 0);
+  _box(rightLegPivot, s * 0.09, s * 0.2, s * 0.09, DARK, 0, -s * 0.1, 0);
+  _box(
+    rightLegPivot,
+    s * 0.1,
+    s * 0.04,
+    s * 0.12,
+    HORN,
+    0,
+    -s * 0.22,
+    s * 0.02,
+  );
+  _setDefaults(rightLegPivot);
+
+  // Small tail
+  _cone(group, s * 0.03, s * 0.18, 4, DARK, 0, -s * 0.02, -s * 0.14, {
+    rx: 0.6,
+  });
+
+  return {
+    group,
+    anim: { leftArmPivot, rightArmPivot, leftLegPivot, rightLegPivot },
+  };
+}
+
 // ── Boss Model (Vampire Lord) ──────────────────────────────────
 
 export function createBossModel(s) {
@@ -632,6 +740,8 @@ export function createEnemyModel(typeKey, size) {
       return createSkeletonModel(size);
     case "zombie":
       return createZombieModel(size);
+    case "imp":
+      return createImpModel(size);
     case "boss":
       return createBossModel(size);
     default:
@@ -697,6 +807,24 @@ export function animateEnemyModel(typeName, anim, time) {
       anim.rightLegPivot.rotation.x = -shamble * 0.5;
       anim.headGroup.rotation.x = h_drx + Math.sin(t * 0.7) * 0.08;
       anim.headGroup.rotation.z = Math.sin(t * 0.5) * 0.12;
+      break;
+    }
+    case "Imp": {
+      const t = time * 4;
+      const hover = Math.sin(t) * 0.25;
+      const la_drx = anim.leftArmPivot.userData.drx ?? 0;
+      const ra_drx = anim.rightArmPivot.userData.drx ?? 0;
+      const la_drz = anim.leftArmPivot.userData.drz ?? 0;
+      const ra_drz = anim.rightArmPivot.userData.drz ?? 0;
+      // Arms sway outward in a casting motion
+      anim.leftArmPivot.rotation.x = la_drx + Math.sin(t * 1.2) * 0.3;
+      anim.rightArmPivot.rotation.x =
+        ra_drx + Math.sin(t * 1.2 + Math.PI) * 0.3;
+      anim.leftArmPivot.rotation.z = la_drz + Math.sin(t * 0.8) * 0.15;
+      anim.rightArmPivot.rotation.z = ra_drz - Math.sin(t * 0.8) * 0.15;
+      // Stubby legs shuffle
+      anim.leftLegPivot.rotation.x = hover * 0.5;
+      anim.rightLegPivot.rotation.x = -hover * 0.5;
       break;
     }
     case "Boss": {
