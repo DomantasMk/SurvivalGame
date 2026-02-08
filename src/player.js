@@ -137,6 +137,7 @@ export function updatePlayer(playerObj, delta, arenaHalf, inputVec) {
 
   // --- Facing direction ---
   const isMoving = Math.abs(inputVec.x) > 0.01 || Math.abs(inputVec.z) > 0.01;
+  playerObj.isMoving = isMoving;
   if (isMoving) {
     playerObj.facingAngle = Math.atan2(inputVec.x, inputVec.z);
     playerObj.mesh.rotation.y = playerObj.facingAngle;

@@ -43,6 +43,7 @@ import {
   resetXpGems,
   setLevelUpCallback,
   getActiveGems,
+  getGemTierForValue,
 } from "./xpManager.js";
 import { createHud, updateHud } from "./hud.js";
 import {
@@ -69,6 +70,7 @@ import {
   flashGroup,
   unflashGroup,
   animateEnemyModel,
+  animatePlayerModel,
 } from "./models.js";
 import {
   createChestManager,
@@ -99,7 +101,7 @@ export const gameState = {
 const ARENA_SIZE = 100;
 const ARENA_HALF = ARENA_SIZE / 2;
 const PLAYER_SIZE = 0.5;
-const STATE_SEND_INTERVAL = 3; // Send state every 3rd frame (~20 Hz at 60fps, interpolation handles smoothness)
+const STATE_SEND_INTERVAL_MS = 50; // Send state every 50ms (~20 Hz), independent of host FPS
 
 // Player configuration (up to 5)
 const COLOR_THEMES = ["blue", "red", "green", "purple", "orange"];
@@ -118,7 +120,10 @@ let _myPlayerArrayIndex = 0; // this client's index in players[]
 
 // Host-side: latest inputs from guest players (keyed by playerIndex)
 const _remoteInputs = {};
-let _sendFrameCounter = 0;
+let _lastStateSendTime = 0;
+let _stateSendCounter = 0; // for throttling less critical data (wv, gm)
+let _pendingStateToSend = null;
+let _stateSendScheduled = false;
 const _pendingUpgradeChoices = {}; // keyed by playerIndex
 
 // Lobby state
@@ -128,14 +133,14 @@ let _lobbyPlayerIndices = [];
 let _spectatingIndex = -1;
 let _spectatorHudEl = null;
 
-// Guest-side: latest state from the host (buffered for smooth interpolation)
-let _currentHostState = null;
+// Guest-side: state buffer for smooth interpolation (render INTERPOLATION_DELAY in the past)
+const GUEST_STATE_BUFFER_SIZE = 5;
+let _guestStateBuffer = []; // { state, guestTime } sorted by guestTime, newest at end
+let _currentHostState = null; // derived each frame from buffer for interpolation
 let _previousHostState = null;
-let _currentStateTime = 0;
-let _previousStateTime = 0;
 let _guestLocalTime = 0;
 let _guestStateDirty = false; // true when a new state arrived but hasn't been blended yet
-const INTERPOLATION_DELAY = 0.01;
+const INTERPOLATION_DELAY = 0.06; // 60ms buffer to smooth jitter and packet delay
 const _guestEnemyMap = new Map();
 const _guestProjectileMap = new Map();
 const _guestEnemyProjectileMap = new Map();
@@ -570,10 +575,10 @@ function _animateHost(clock, scene, camera, renderer, world, updateLights) {
       renderer.render(scene, camera);
     }
 
-    // --- Send state to guests (always, even when hidden) ---
-    _sendFrameCounter++;
-    if (_sendFrameCounter % STATE_SEND_INTERVAL === 0) {
+    // --- Send state to guests on fixed interval (independent of frame rate) ---
+    if (now - _lastStateSendTime >= STATE_SEND_INTERVAL_MS) {
       _sendGameState();
+      _lastStateSendTime = now;
     }
 
     // --- Check game over (ALL players dead) ---
@@ -612,99 +617,114 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
       });
     }
 
-    // --- Apply state updates with smooth interpolation ---
-    if (_currentHostState) {
-      if (!_previousHostState) {
-        // First state ever — snap everything to it
-        _applyHostState(_currentHostState, scene, 1.0);
-        _previousHostState = _deepCloneState(_currentHostState);
-        _previousStateTime = _currentStateTime;
+    // --- Apply state updates with time-based interpolation buffer ---
+    const renderTime = _guestLocalTime - INTERPOLATION_DELAY;
+    if (_guestStateBuffer.length > 0) {
+      // Entity lifecycle sync when a new state arrived (use newest state in buffer)
+      if (_guestStateDirty) {
+        const newest = _guestStateBuffer[_guestStateBuffer.length - 1].state;
+        _syncGuestEnemies(newest.en, scene, 1.0);
+        _syncGuestProjectiles(newest.pr, scene, 1.0);
+        if (newest.ep) _syncGuestEnemyProjectiles(newest.ep, scene);
+        if (newest.gm) _syncGuestGems(newest.gm, scene, 1.0);
+        if (newest.wv) _syncGuestWeaponVisuals(newest.wv, scene);
+        if (newest.ch) _syncGuestChests(newest.ch, scene);
+        gameState.gameTime = newest.gt;
+        gameState.totalKills = newest.tk;
+        gameState.gameOver = newest.go;
+        gameState.currentWave = newest.cw;
+        gameState.bossActive = newest.ba;
+        gameState.bossHp = newest.bh;
+        gameState.bossMaxHp = newest.bmh;
+        if (newest.go) _showGameOver();
         _guestStateDirty = false;
+      }
+
+      // Find two states that bracket renderTime for interpolation
+      let prevEntry = _guestStateBuffer[0];
+      let nextEntry = _guestStateBuffer[0];
+      let t = 1;
+      if (renderTime <= prevEntry.guestTime) {
+        nextEntry = prevEntry;
+        t = 1;
+      } else if (
+        renderTime >= _guestStateBuffer[_guestStateBuffer.length - 1].guestTime
+      ) {
+        prevEntry = _guestStateBuffer[_guestStateBuffer.length - 1];
+        nextEntry = prevEntry;
+        t = 1;
       } else {
-        // When a new state just arrived, sync entities (create/remove meshes)
-        // and update non-positional state. Positions will be interpolated below.
-        if (_guestStateDirty) {
-          // Sync entity lifecycle (creates new, removes old) — positions get overwritten by interpolation
-          _syncGuestEnemies(_currentHostState.en, scene, 1.0);
-          _syncGuestProjectiles(_currentHostState.pr, scene, 1.0);
-          if (_currentHostState.ep) {
-            _syncGuestEnemyProjectiles(_currentHostState.ep, scene);
+        for (let i = 0; i < _guestStateBuffer.length - 1; i++) {
+          if (
+            _guestStateBuffer[i].guestTime <= renderTime &&
+            renderTime < _guestStateBuffer[i + 1].guestTime
+          ) {
+            prevEntry = _guestStateBuffer[i];
+            nextEntry = _guestStateBuffer[i + 1];
+            const span = nextEntry.guestTime - prevEntry.guestTime;
+            t =
+              span > 0
+                ? Math.min(
+                    Math.max((renderTime - prevEntry.guestTime) / span, 0),
+                    1,
+                  )
+                : 1;
+            break;
           }
-          _syncGuestGems(_currentHostState.gm, scene, 1.0);
-          if (_currentHostState.wv) {
-            _syncGuestWeaponVisuals(_currentHostState.wv, scene);
-          }
-          if (_currentHostState.ch) {
-            _syncGuestChests(_currentHostState.ch, scene);
-          }
-          // Apply game-state scalars
-          gameState.gameTime = _currentHostState.gt;
-          gameState.totalKills = _currentHostState.tk;
-          gameState.gameOver = _currentHostState.go;
-          gameState.currentWave = _currentHostState.cw;
-          gameState.bossActive = _currentHostState.ba;
-          gameState.bossHp = _currentHostState.bh;
-          gameState.bossMaxHp = _currentHostState.bmh;
-          if (_currentHostState.go) _showGameOver();
-          _guestStateDirty = false;
         }
+      }
+      _previousHostState = prevEntry.state;
+      _currentHostState = nextEntry.state;
 
-        // Smoothly interpolate positions every frame
-        if (_currentStateTime > _previousStateTime) {
-          const elapsed = performance.now() - _currentStateTime;
-          const interval = _currentStateTime - _previousStateTime;
-          const t = Math.min(Math.max(elapsed / interval, 0), 1);
-
-          // Interpolate player positions (main source of camera stutter)
-          for (let i = 0; i < players.length; i++) {
-            if (
-              _previousHostState.pl &&
-              _previousHostState.pl[i] &&
-              _currentHostState.pl &&
-              _currentHostState.pl[i]
-            ) {
-              _interpolatePlayerState(
-                players[i],
-                _previousHostState.pl[i],
-                _currentHostState.pl[i],
-                t,
-              );
-            }
-          }
-
-          // Interpolate enemy, projectile, and gem positions
-          _interpolateGuestEnemies(
-            _previousHostState.en,
-            _currentHostState.en,
-            scene,
-            t,
-          );
-          _interpolateGuestProjectiles(
-            _previousHostState.pr,
-            _currentHostState.pr,
-            scene,
-            t,
-          );
-          if (_previousHostState.ep && _currentHostState.ep) {
-            _interpolateGuestEnemyProjectiles(
-              _previousHostState.ep,
-              _currentHostState.ep,
-              scene,
-              t,
-            );
-          }
-          _interpolateGuestGems(
-            _previousHostState.gm,
-            _currentHostState.gm,
-            scene,
+      // Interpolate player positions
+      for (let i = 0; i < players.length; i++) {
+        if (
+          _previousHostState.pl &&
+          _previousHostState.pl[i] &&
+          _currentHostState.pl &&
+          _currentHostState.pl[i]
+        ) {
+          _interpolatePlayerState(
+            players[i],
+            _previousHostState.pl[i],
+            _currentHostState.pl[i],
             t,
           );
         }
       }
+      _interpolateGuestEnemies(
+        _previousHostState.en,
+        _currentHostState.en,
+        scene,
+        t,
+      );
+      _interpolateGuestProjectiles(
+        _previousHostState.pr,
+        _currentHostState.pr,
+        scene,
+        t,
+      );
+      if (_previousHostState.ep && _currentHostState.ep) {
+        _interpolateGuestEnemyProjectiles(
+          _previousHostState.ep,
+          _currentHostState.ep,
+          scene,
+          t,
+        );
+      }
+      if (_previousHostState.gm && _currentHostState.gm) {
+        _interpolateGuestGems(
+          _previousHostState.gm,
+          _currentHostState.gm,
+          scene,
+          t,
+        );
+      }
     }
 
-    // --- Continuously animate enemies, gems, chests, and buff visuals ---
+    // --- Continuously animate enemies, players (walk), gems, chests, and buff visuals ---
     _animateGuestEnemies(_guestLocalTime);
+    _animateGuestPlayers(_guestLocalTime);
     _animateGuestGems(delta);
     _animateGuestChests(gameState.gameTime);
     updateBuffVisuals(players, gameState.gameTime);
@@ -730,6 +750,8 @@ function _animateGuest(clock, scene, camera, renderer, updateLights) {
 // ---------- State Serialization (Host -> Guests) ----------
 
 function _sendGameState() {
+  _stateSendCounter++;
+  const includeVisuals = _stateSendCounter % 2 === 0; // throttle wv/gm to every 2nd packet to reduce payload
   const state = {
     type: "state",
     gt: gameState.gameTime,
@@ -773,13 +795,18 @@ function _sendGameState() {
       z: p.mesh.position.z,
       c: p.mesh.material.color.getHex(),
     })),
-    gm: getActiveGems().map((g) => ({
-      id: g.id,
-      x: g.mesh.position.x,
-      y: g.mesh.position.y,
-      z: g.mesh.position.z,
-    })),
-    wv: getActiveVisualStates(players),
+    ...(includeVisuals
+      ? {
+          gm: getActiveGems().map((g) => ({
+            id: g.id,
+            x: g.mesh.position.x,
+            y: g.mesh.position.y,
+            z: g.mesh.position.z,
+            v: g.value,
+          })),
+          wv: getActiveVisualStates(players),
+        }
+      : {}),
     ch: getActiveChests().map((c) => ({
       id: c.id,
       x: c.mesh.position.x,
@@ -792,7 +819,22 @@ function _sendGameState() {
     bh: gameState.bossHp,
     bmh: gameState.bossMaxHp,
   };
-  send(state);
+  _pendingStateToSend = state;
+  if (!_stateSendScheduled) {
+    _stateSendScheduled = true;
+    const flush = () => {
+      if (_pendingStateToSend) {
+        send(_pendingStateToSend);
+        _pendingStateToSend = null;
+      }
+      _stateSendScheduled = false;
+    };
+    if (typeof requestIdleCallback !== "undefined") {
+      requestIdleCallback(flush, { timeout: 25 });
+    } else {
+      setTimeout(flush, 0);
+    }
+  }
 }
 
 function _serializePlayer(p) {
@@ -800,6 +842,7 @@ function _serializePlayer(p) {
     x: p.mesh.position.x,
     z: p.mesh.position.z,
     fa: p.facingAngle,
+    mv: !!p.isMoving,
     hp: p.hp,
     mhp: p.maxHp,
     xp: p.xp,
@@ -841,6 +884,7 @@ function _deepCloneState(state) {
         x: p.x,
         z: p.z,
         fa: p.fa,
+        mv: p.mv,
         hp: p.hp,
         mhp: p.mhp,
         xp: p.xp,
@@ -897,6 +941,7 @@ function _deepCloneState(state) {
         x: state.gm[i].x,
         y: state.gm[i].y,
         z: state.gm[i].z,
+        v: state.gm[i].v,
       };
     }
   }
@@ -1017,6 +1062,7 @@ function _applyPlayerState(playerObj, s, interpolationFactor) {
   playerObj.mesh.position.z = s.z;
   playerObj.mesh.rotation.y = s.fa;
   playerObj.facingAngle = s.fa;
+  playerObj.isMoving = s.mv === true;
   playerObj.hp = s.hp;
   playerObj.maxHp = s.mhp;
   playerObj.xp = s.xp;
@@ -1039,6 +1085,7 @@ function _applyPlayerState(playerObj, s, interpolationFactor) {
 
   if (!s.al) {
     // Dead: rotate to lie on the ground
+    playerObj.isMoving = false;
     playerObj.mesh.rotation.x = -Math.PI / 2;
     playerObj.mesh.position.y = 0.15;
     playerObj.mesh.visible = true;
@@ -1063,6 +1110,7 @@ function _interpolatePlayerState(playerObj, prevS, currS, t) {
   playerObj.mesh.rotation.y = prevS.fa + rotDiff * t;
 
   playerObj.facingAngle = currS.fa;
+  playerObj.isMoving = currS.mv === true;
   playerObj.hp = currS.hp;
   playerObj.maxHp = currS.mhp;
   playerObj.xp = currS.xp;
@@ -1085,6 +1133,7 @@ function _interpolatePlayerState(playerObj, prevS, currS, t) {
 
   if (!currS.al) {
     // Dead: rotate to lie on the ground
+    playerObj.isMoving = false;
     playerObj.mesh.rotation.x = -Math.PI / 2;
     playerObj.mesh.position.y = 0.15;
     playerObj.mesh.visible = true;
@@ -1198,6 +1247,16 @@ function _animateGuestEnemies(localTime) {
         entry.anim,
         localTime + entry.animOffset,
       );
+    }
+  }
+}
+
+function _animateGuestPlayers(localTime) {
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
+    if (p.alive && p.anim) {
+      const isMoving = !!p.isMoving;
+      animatePlayerModel(p.anim, isMoving, localTime + i * 0.3);
     }
   }
 }
@@ -1331,18 +1390,26 @@ function _syncGuestGems(gemStates, scene, interpolationFactor) {
 
     let entry = _guestGemMap.get(gs.id);
     if (!entry) {
-      const geo = new THREE.OctahedronGeometry(0.15, 0);
+      const tier = getGemTierForValue(gs.v ?? 1);
+      const geo = new THREE.OctahedronGeometry(tier.size, 0);
       const mat = new THREE.MeshStandardMaterial({
-        color: 0x44aaff,
-        emissive: 0x44aaff,
+        color: tier.color,
+        emissive: tier.color,
         emissiveIntensity: 0.5,
         roughness: 0.3,
         metalness: 0.8,
       });
       const mesh = new THREE.Mesh(geo, mat);
       scene.add(mesh);
-      entry = { mesh };
+      entry = { mesh, value: gs.v };
       _guestGemMap.set(gs.id, entry);
+    } else if (gs.v != null && gs.v !== entry.value && entry.mesh.material) {
+      entry.value = gs.v;
+      const tier = getGemTierForValue(gs.v);
+      entry.mesh.material.color.setHex(tier.color);
+      entry.mesh.material.emissive.setHex(tier.color);
+      if (entry.mesh.geometry) entry.mesh.geometry.dispose();
+      entry.mesh.geometry = new THREE.OctahedronGeometry(tier.size, 0);
     }
 
     entry.mesh.position.set(gs.x, gs.y, gs.z);
@@ -1639,15 +1706,15 @@ function _handleHostMessage(msg) {
 function _handleGuestMessage(msg) {
   switch (msg.type) {
     case "state": {
-      const now = performance.now();
-      if (_currentHostState) {
-        _previousHostState = _deepCloneState(_currentHostState);
-        _previousStateTime = _currentStateTime;
+      // Use parsed msg directly (read-only); no clone needed, saving CPU when entity count is high
+      _guestStateBuffer.push({
+        state: msg,
+        guestTime: _guestLocalTime,
+      });
+      if (_guestStateBuffer.length > GUEST_STATE_BUFFER_SIZE) {
+        _guestStateBuffer.shift();
       }
-      _currentHostState = _deepCloneState(msg);
-      _currentStateTime = now;
       _guestStateDirty = true;
-      // Don't apply immediately — the guest render loop will interpolate smoothly
       break;
     }
 

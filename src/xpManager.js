@@ -29,6 +29,14 @@ const GEM_TIERS = [
   { maxValue: Infinity, color: 0xff44ff, size: 0.35 }, // purple (boss)
 ];
 
+/** Get tier (color, size) for a gem value. Used by host and guests for visuals. */
+export function getGemTierForValue(value) {
+  const v = typeof value === "number" && value >= 0 ? value : 1;
+  const tier =
+    GEM_TIERS.find((t) => v <= t.maxValue) || GEM_TIERS[GEM_TIERS.length - 1];
+  return { color: tier.color, size: tier.size };
+}
+
 const COLLECT_SPEED = 18;
 const GEM_Y = 0.3;
 
