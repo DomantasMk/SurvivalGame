@@ -1,1 +1,30 @@
+# Dependencies
 node_modules/
+
+# Build output (Vite)
+dist/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Logs and debug
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE (optional)
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Vite cache
+.vite/
+
+# Test coverage (if you add tests later)
+coverage/
